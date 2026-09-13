@@ -50,3 +50,13 @@ the existing library tables. The public typed property structs are unchanged.
 Eight fixed-wire and boundary regressions are in `tests/runtime_v5_codec.rs`.
 The Runtime receive adapter uses this decoder and preserves original property
 order; MQTT 5 outgoing encoding/state and explicit recovery are still pending.
+
+## Admission and header integration
+
+`MqttState::initial_memory_bound` exposes a conservative allocation bound before
+constructing state or opening a transport. Boundary tests compare it with actual
+retained allocations. The Runtime owns the corresponding reservation throughout
+the state lifetime and rejects insufficient budgets before network dispatch.
+
+`FixedHeader::parse` exposes the existing MQTT 5 header validation and its length
+fields so transport framing does not duplicate packet flag and QoS rules.

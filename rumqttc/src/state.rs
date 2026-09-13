@@ -82,6 +82,19 @@ pub struct MqttState {
 }
 
 impl MqttState {
+    /// Conservative initial allocation bound for pre-admission before creating
+    /// the state or connecting a transport. The fixed-bitset allowances include
+    /// 64 bytes of block/alignment rounding per allocation. Regression tests
+    /// compare this bound with the actual retained allocations at boundary sizes.
+    pub fn initial_memory_bound(max_inflight: u16) -> usize {
+        let slots = usize::from(max_inflight) + 1;
+        std::mem::size_of::<Self>()
+            + slots * std::mem::size_of::<Option<Publish>>()
+            + 3 * (65536 / 8 + 64)
+            + 2 * (slots.div_ceil(8) + 64)
+            + 100 * std::mem::size_of::<Event>()
+    }
+
     /// Creates new mqtt state. Same state should be used during a
     /// connection for persistent sessions while new state should
     /// instantiated for clean sessions
