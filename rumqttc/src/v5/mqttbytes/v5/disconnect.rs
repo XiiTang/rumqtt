@@ -167,11 +167,16 @@ impl DisconnectProperties {
     }
 
     pub fn extract(bytes: &mut Bytes) -> Result<Option<Self>, Error> {
-        let (properties_len_len, properties_len) = length(bytes.iter())?;
+        Self::extract_traced(bytes, &mut Vec::new())
+    }
 
-        bytes.advance(properties_len_len);
-
-        if properties_len == 0 {
+    pub(super) fn extract_traced(
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<Self>, Error> {
+        let mut section = super::read_properties_section(bytes)?;
+        let bytes = &mut section;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
@@ -180,32 +185,32 @@ impl DisconnectProperties {
         let mut user_properties = Vec::new();
         let mut server_reference = None;
 
-        let mut cursor = 0;
+        let mut seen = 0u64;
+        let mut count = 0usize;
 
-        // read until cursor reaches property length. properties_len = 0 will skip this loop
-        while cursor < properties_len {
+        while bytes.has_remaining() {
             let prop = read_u8(bytes)?;
-            cursor += 1;
+            super::validate_property_occurrence(prop, prop == 38, &mut seen, &mut count)?;
+            order.push(prop);
 
             match property(prop)? {
                 PropertyType::SessionExpiryInterval => {
                     session_expiry_interval = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::ReasonString => {
                     let reason = read_mqtt_string(bytes)?;
-                    cursor += 2 + reason.len();
+
                     reason_string = Some(reason);
                 }
                 PropertyType::UserProperty => {
                     let key = read_mqtt_string(bytes)?;
                     let value = read_mqtt_string(bytes)?;
-                    cursor += 2 + key.len() + 2 + value.len();
+
                     user_properties.push((key, value));
                 }
                 PropertyType::ServerReference => {
                     let reference = read_mqtt_string(bytes)?;
-                    cursor += 2 + reference.len();
+
                     server_reference = Some(reference);
                 }
                 _ => return Err(Error::InvalidPropertyType(prop)),
@@ -292,7 +297,15 @@ impl Disconnect {
         1 + remaining_len_size + len
     }
 
-    pub fn read(fixed_header: FixedHeader, mut bytes: Bytes) -> Result<Self, Error> {
+    pub fn read(fixed_header: FixedHeader, bytes: Bytes) -> Result<Self, Error> {
+        Self::read_traced(fixed_header, bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        fixed_header: FixedHeader,
+        mut bytes: Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Self, Error> {
         let packet_type = fixed_header.byte1 >> 4;
         let flags = fixed_header.byte1 & 0b0000_1111;
 
@@ -314,9 +327,16 @@ impl Disconnect {
 
         let disconnect = Self {
             reason_code: reason_code.try_into()?,
-            properties: DisconnectProperties::extract(&mut bytes)?,
+            properties: if bytes.is_empty() {
+                None
+            } else {
+                DisconnectProperties::extract_traced(&mut bytes, order)?
+            },
         };
 
+        if !bytes.is_empty() {
+            return Err(Error::MalformedPacket);
+        }
         Ok(disconnect)
     }
 

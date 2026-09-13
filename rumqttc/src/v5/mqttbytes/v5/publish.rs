@@ -56,7 +56,15 @@ impl Publish {
         len
     }
 
-    pub fn read(fixed_header: FixedHeader, mut bytes: Bytes) -> Result<Publish, Error> {
+    pub fn read(fixed_header: FixedHeader, bytes: Bytes) -> Result<Publish, Error> {
+        Self::read_traced(fixed_header, bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        fixed_header: FixedHeader,
+        mut bytes: Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Publish, Error> {
         let qos_num = (fixed_header.byte1 & 0b0110) >> 1;
         let qos = qos(qos_num).ok_or(Error::InvalidQoS(qos_num))?;
         let dup = (fixed_header.byte1 & 0b1000) != 0;
@@ -76,7 +84,7 @@ impl Publish {
             return Err(Error::PacketIdZero);
         }
 
-        let properties = PublishProperties::read(&mut bytes)?;
+        let properties = PublishProperties::read_traced(&mut bytes, order)?;
         let publish = Publish {
             dup,
             retain,
@@ -174,6 +182,13 @@ impl PublishProperties {
     }
 
     pub fn read(bytes: &mut Bytes) -> Result<Option<PublishProperties>, Error> {
+        Self::read_traced(bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<PublishProperties>, Error> {
         let mut payload_format_indicator = None;
         let mut message_expiry_interval = None;
         let mut topic_alias = None;
@@ -183,56 +198,59 @@ impl PublishProperties {
         let mut subscription_identifiers = Vec::new();
         let mut content_type = None;
 
-        let (properties_len_len, properties_len) = length(bytes.iter())?;
-        bytes.advance(properties_len_len);
-        if properties_len == 0 {
+        let mut section = super::read_properties_section(bytes)?;
+        let bytes = &mut section;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
-        let mut cursor = 0;
-        // read until cursor reaches property length. properties_len = 0 will skip this loop
-        while cursor < properties_len {
+        let mut seen = 0u64;
+        let mut count = 0usize;
+        while bytes.has_remaining() {
             let prop = read_u8(bytes)?;
-            cursor += 1;
+            super::validate_property_occurrence(
+                prop,
+                prop == 38 || prop == 11,
+                &mut seen,
+                &mut count,
+            )?;
+            order.push(prop);
 
             match property(prop)? {
                 PropertyType::PayloadFormatIndicator => {
                     payload_format_indicator = Some(read_u8(bytes)?);
-                    cursor += 1;
                 }
                 PropertyType::MessageExpiryInterval => {
                     message_expiry_interval = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::TopicAlias => {
                     topic_alias = Some(read_u16(bytes)?);
-                    cursor += 2;
                 }
                 PropertyType::ResponseTopic => {
                     let topic = read_mqtt_string(bytes)?;
-                    cursor += 2 + topic.len();
+
                     response_topic = Some(topic);
                 }
                 PropertyType::CorrelationData => {
                     let data = read_mqtt_bytes(bytes)?;
-                    cursor += 2 + data.len();
+
                     correlation_data = Some(data);
                 }
                 PropertyType::UserProperty => {
                     let key = read_mqtt_string(bytes)?;
                     let value = read_mqtt_string(bytes)?;
-                    cursor += 2 + key.len() + 2 + value.len();
+
                     user_properties.push((key, value));
                 }
                 PropertyType::SubscriptionIdentifier => {
                     let (id_len, id) = length(bytes.iter())?;
-                    cursor += 1 + id_len;
+
                     bytes.advance(id_len);
                     subscription_identifiers.push(id);
                 }
                 PropertyType::ContentType => {
                     let typ = read_mqtt_string(bytes)?;
-                    cursor += 2 + typ.len();
+
                     content_type = Some(typ);
                 }
                 _ => return Err(Error::InvalidPropertyType(prop)),
