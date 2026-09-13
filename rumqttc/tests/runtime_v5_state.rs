@@ -258,3 +258,88 @@ fn admission_bounds_include_table_growth_and_property_allocations() {
         assert!(s.retained_bytes() <= bound, "incoming allocation {id}");
     }
 }
+
+#[test]
+fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
+    let mut s = state(false);
+    s.handle_incoming_packet(Packet::ConnAck(ConnAck {
+        session_present: false,
+        code: ConnectReturnCode::Success,
+        properties: Some(ConnAckProperties {
+            topic_alias_max: Some(1),
+            ..Default::default()
+        }),
+    }))
+    .unwrap();
+    for topic in ["first", "", "changed"] {
+        let p = Publish::new(
+            topic,
+            QoS::AtLeastOnce,
+            b"x".to_vec(),
+            Some(PublishProperties {
+                topic_alias: Some(1),
+                ..Default::default()
+            }),
+        );
+        s.handle_outgoing_packet(Request::Publish(p)).unwrap();
+    }
+    s.resume_session();
+    s.handle_incoming_packet(Packet::ConnAck(ConnAck {
+        session_present: true,
+        code: ConnectReturnCode::Success,
+        properties: Some(ConnAckProperties {
+            receive_max: Some(1),
+            ..Default::default()
+        }),
+    }))
+    .unwrap();
+    for expected in ["first", "first", "changed"] {
+        let Packet::Publish(p) = s.next_resumed_packet().unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.topic.as_ref(), expected.as_bytes());
+        assert!(p.dup);
+        assert!(p.properties.unwrap().topic_alias.is_none());
+        assert!(!s.has_resumed_packet());
+        s.handle_incoming_packet(Packet::PubAck(PubAck::new(p.pkid, None)))
+            .unwrap();
+    }
+    assert!(!s.pending());
+}
+
+#[test]
+fn expired_publication_is_not_replayed_after_resume() {
+    let mut s = state(false);
+    s.handle_outgoing_packet(Request::Publish(Publish::new(
+        "expired",
+        QoS::AtLeastOnce,
+        b"x".to_vec(),
+        Some(PublishProperties {
+            message_expiry_interval: Some(0),
+            ..Default::default()
+        }),
+    )))
+    .unwrap();
+    s.resume_session();
+    assert!(s.next_resumed_packet().is_none());
+    assert!(!s.pending());
+}
+
+#[test]
+fn cancelled_before_writer_publication_is_not_transmitted_by_resume() {
+    let mut s = state(false);
+    let Packet::Publish(p) = s
+        .handle_outgoing_packet(Request::Publish(publish(QoS::AtLeastOnce, 0, false)))
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    s.track_publish_transmission(
+        p.pkid,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    s.resume_session();
+    assert!(!s.has_resumed_packet());
+    assert!(!s.pending());
+}
