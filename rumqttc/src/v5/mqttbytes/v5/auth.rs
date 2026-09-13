@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::{
-    len_len, property, read_mqtt_bytes, read_mqtt_string, read_u8, write_mqtt_bytes,
-    write_mqtt_string, write_remaining_length, Error, FixedHeader, PropertyType,
+    len_len, property, read_mqtt_bytes, read_mqtt_string, read_u8, write_remaining_length, Error,
+    FixedHeader, PropertyType,
 };
 
 /// Auth packet reason code
@@ -95,6 +95,13 @@ impl Auth {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         buffer.put_u8(0xF0);
 
         let len = self.len();
@@ -105,7 +112,7 @@ impl Auth {
         }
         self.code.write(buffer)?;
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -202,30 +209,34 @@ impl AuthProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(authentication_method) = &self.method {
-            buffer.put_u8(PropertyType::AuthenticationMethod as u8);
-            write_mqtt_string(buffer, authentication_method);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.method.is_some())
+            + usize::from(self.data.is_some())
+            + usize::from(self.reason.is_some())
+            + self.user_properties.len();
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(authentication_data) = &self.data {
-            buffer.put_u8(PropertyType::AuthenticationData as u8);
-            write_mqtt_bytes(buffer, authentication_data);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.method {
+            values.push((21, Property::String(value)));
         }
-
-        if let Some(reason) = &self.reason {
-            buffer.put_u8(PropertyType::ReasonString as u8);
-            write_mqtt_string(buffer, reason);
+        if let Some(value) = &self.data {
+            values.push((22, Property::Binary(value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.reason {
+            values.push((31, Property::String(value)));
         }
-
-        Ok(())
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
+        }
+        write_properties(buffer, values, order)
     }
 }

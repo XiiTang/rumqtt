@@ -72,6 +72,13 @@ impl Unsubscribe {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         buffer.put_u8(0xA2);
 
         // write remaining length
@@ -82,7 +89,7 @@ impl Unsubscribe {
         buffer.put_u16(self.pkid);
 
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -150,16 +157,23 @@ impl UnsubscribeProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = self.user_properties.len();
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        Ok(())
+        let mut values = Vec::with_capacity(count);
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 

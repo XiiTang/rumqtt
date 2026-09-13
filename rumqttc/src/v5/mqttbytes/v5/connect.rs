@@ -101,6 +101,16 @@ impl Connect {
         l: &Option<Login>,
         buffer: &mut BytesMut,
     ) -> Result<usize, Error> {
+        self.write_ordered(will, l, buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        will: &Option<LastWill>,
+        l: &Option<Login>,
+        buffer: &mut BytesMut,
+        order: Option<&super::PropertyOrder>,
+    ) -> Result<usize, Error> {
+        let offset = buffer.len();
         let len = self.len(will, l);
 
         buffer.put_u8(0b0001_0000);
@@ -108,7 +118,7 @@ impl Connect {
         write_mqtt_string(buffer, "MQTT");
 
         buffer.put_u8(0x05);
-        let flags_index = 1 + count + 2 + 4 + 1;
+        let flags_index = offset + 1 + count + 2 + 4 + 1;
 
         let mut connect_flags = 0;
         if self.clean_start {
@@ -119,7 +129,7 @@ impl Connect {
         buffer.put_u16(self.keep_alive);
 
         match &self.properties {
-            Some(p) => p.write(buffer)?,
+            Some(p) => p.write_ordered(buffer, order.map(|o| o.packet.as_slice()))?,
             None => {
                 write_remaining_length(buffer, 0)?;
             }
@@ -128,7 +138,7 @@ impl Connect {
         write_mqtt_string(buffer, &self.client_id);
 
         if let Some(w) = will {
-            connect_flags |= w.write(buffer)?;
+            connect_flags |= w.write_ordered(buffer, order.map(|o| o.will.as_slice()))?;
         }
 
         if let Some(l) = l {
@@ -309,56 +319,55 @@ impl ConnectProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(session_expiry_interval) = self.session_expiry_interval {
-            buffer.put_u8(PropertyType::SessionExpiryInterval as u8);
-            buffer.put_u32(session_expiry_interval);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.session_expiry_interval.is_some())
+            + usize::from(self.receive_maximum.is_some())
+            + usize::from(self.max_packet_size.is_some())
+            + usize::from(self.topic_alias_max.is_some())
+            + usize::from(self.request_response_info.is_some())
+            + usize::from(self.request_problem_info.is_some())
+            + self.user_properties.len()
+            + usize::from(self.authentication_method.is_some())
+            + usize::from(self.authentication_data.is_some());
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(receive_maximum) = self.receive_maximum {
-            buffer.put_u8(PropertyType::ReceiveMaximum as u8);
-            buffer.put_u16(receive_maximum);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.session_expiry_interval {
+            values.push((17, Property::Integer(*value)));
         }
-
-        if let Some(max_packet_size) = self.max_packet_size {
-            buffer.put_u8(PropertyType::MaximumPacketSize as u8);
-            buffer.put_u32(max_packet_size);
+        if let Some(value) = &self.receive_maximum {
+            values.push((33, Property::Short(*value)));
         }
-
-        if let Some(topic_alias_max) = self.topic_alias_max {
-            buffer.put_u8(PropertyType::TopicAliasMaximum as u8);
-            buffer.put_u16(topic_alias_max);
+        if let Some(value) = &self.max_packet_size {
+            values.push((39, Property::Integer(*value)));
         }
-
-        if let Some(request_response_info) = self.request_response_info {
-            buffer.put_u8(PropertyType::RequestResponseInformation as u8);
-            buffer.put_u8(request_response_info);
+        if let Some(value) = &self.topic_alias_max {
+            values.push((34, Property::Short(*value)));
         }
-
-        if let Some(request_problem_info) = self.request_problem_info {
-            buffer.put_u8(PropertyType::RequestProblemInformation as u8);
-            buffer.put_u8(request_problem_info);
+        if let Some(value) = &self.request_response_info {
+            values.push((25, Property::Byte(*value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.request_problem_info {
+            values.push((23, Property::Byte(*value)));
         }
-
-        if let Some(authentication_method) = &self.authentication_method {
-            buffer.put_u8(PropertyType::AuthenticationMethod as u8);
-            write_mqtt_string(buffer, authentication_method);
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
         }
-
-        if let Some(authentication_data) = &self.authentication_data {
-            buffer.put_u8(PropertyType::AuthenticationData as u8);
-            write_mqtt_bytes(buffer, authentication_data);
+        if let Some(value) = &self.authentication_method {
+            values.push((21, Property::String(value)));
         }
-
-        Ok(())
+        if let Some(value) = &self.authentication_data {
+            values.push((22, Property::Binary(value)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 
@@ -448,6 +457,13 @@ impl LastWill {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<u8, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<u8, Error> {
         let mut connect_flags = 0;
 
         connect_flags |= 0x04 | ((self.qos as u8) << 3);
@@ -456,7 +472,7 @@ impl LastWill {
         }
 
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -589,107 +605,95 @@ impl LastWillProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(delay_interval) = self.delay_interval {
-            buffer.put_u8(PropertyType::WillDelayInterval as u8);
-            buffer.put_u32(delay_interval);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.delay_interval.is_some())
+            + usize::from(self.payload_format_indicator.is_some())
+            + usize::from(self.message_expiry_interval.is_some())
+            + usize::from(self.content_type.is_some())
+            + usize::from(self.response_topic.is_some())
+            + usize::from(self.correlation_data.is_some())
+            + self.user_properties.len();
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(payload_format_indicator) = self.payload_format_indicator {
-            buffer.put_u8(PropertyType::PayloadFormatIndicator as u8);
-            buffer.put_u8(payload_format_indicator);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.delay_interval {
+            values.push((24, Property::Integer(*value)));
         }
-
-        if let Some(message_expiry_interval) = self.message_expiry_interval {
-            buffer.put_u8(PropertyType::MessageExpiryInterval as u8);
-            buffer.put_u32(message_expiry_interval);
+        if let Some(value) = &self.payload_format_indicator {
+            values.push((1, Property::Byte(*value)));
         }
-
-        if let Some(typ) = &self.content_type {
-            buffer.put_u8(PropertyType::ContentType as u8);
-            write_mqtt_string(buffer, typ);
+        if let Some(value) = &self.message_expiry_interval {
+            values.push((2, Property::Integer(*value)));
         }
-
-        if let Some(topic) = &self.response_topic {
-            buffer.put_u8(PropertyType::ResponseTopic as u8);
-            write_mqtt_string(buffer, topic);
+        if let Some(value) = &self.content_type {
+            values.push((3, Property::String(value)));
         }
-
-        if let Some(data) = &self.correlation_data {
-            buffer.put_u8(PropertyType::CorrelationData as u8);
-            write_mqtt_bytes(buffer, data);
+        if let Some(value) = &self.response_topic {
+            values.push((8, Property::String(value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.correlation_data {
+            values.push((9, Property::Binary(value)));
         }
-
-        Ok(())
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Login {
-    pub username: String,
-    pub password: String,
+    /// Presence is independent of an empty value in MQTT 5.
+    pub username: Option<String>,
+    /// MQTT passwords are binary data, not UTF-8 strings.
+    pub password: Option<Bytes>,
 }
-
 impl Login {
-    pub fn new<U: Into<String>, P: Into<String>>(u: U, p: P) -> Login {
-        Login {
-            username: u.into(),
-            password: p.into(),
+    pub fn new<U: Into<String>, P: Into<String>>(u: U, p: P) -> Self {
+        Self {
+            username: Some(u.into()),
+            password: Some(Bytes::from(p.into())),
         }
     }
-
-    pub fn read(connect_flags: u8, bytes: &mut Bytes) -> Result<Option<Login>, Error> {
-        let username = match connect_flags & 0b1000_0000 {
-            0 => String::new(),
-            _ => read_mqtt_string(bytes)?,
-        };
-
-        let password = match connect_flags & 0b0100_0000 {
-            0 => String::new(),
-            _ => read_mqtt_string(bytes)?,
-        };
-
-        if username.is_empty() && password.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Login { username, password }))
+    pub fn read(flags: u8, bytes: &mut Bytes) -> Result<Option<Self>, Error> {
+        if flags & 0xc0 == 0 {
+            return Ok(None);
         }
+        Ok(Some(Self {
+            username: if flags & 0x80 != 0 {
+                Some(read_mqtt_string(bytes)?)
+            } else {
+                None
+            },
+            password: if flags & 0x40 != 0 {
+                Some(read_mqtt_bytes(bytes)?)
+            } else {
+                None
+            },
+        }))
     }
-
     fn len(&self) -> usize {
-        let mut len = 0;
-
-        if !self.username.is_empty() {
-            len += 2 + self.username.len();
-        }
-
-        if !self.password.is_empty() {
-            len += 2 + self.password.len();
-        }
-
-        len
+        self.username.as_ref().map_or(0, |v| 2 + v.len())
+            + self.password.as_ref().map_or(0, |v| 2 + v.len())
     }
-
     pub fn write(&self, buffer: &mut BytesMut) -> u8 {
-        let mut connect_flags = 0;
-        if !self.username.is_empty() {
-            connect_flags |= 0x80;
-            write_mqtt_string(buffer, &self.username);
+        let mut flags = 0;
+        if let Some(value) = &self.username {
+            flags |= 0x80;
+            write_mqtt_string(buffer, value);
         }
-
-        if !self.password.is_empty() {
-            connect_flags |= 0x40;
-            write_mqtt_string(buffer, &self.password);
+        if let Some(value) = &self.password {
+            flags |= 0x40;
+            write_mqtt_bytes(buffer, value);
         }
-
-        connect_flags
+        flags
     }
 }
 

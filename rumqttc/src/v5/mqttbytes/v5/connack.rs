@@ -97,6 +97,13 @@ impl ConnAck {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         let len = Self::len(self);
         buffer.put_u8(0x20);
 
@@ -105,7 +112,7 @@ impl ConnAck {
         buffer.put_u8(connect_code(self.code));
 
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -342,96 +349,87 @@ impl ConnAckProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(session_expiry_interval) = self.session_expiry_interval {
-            buffer.put_u8(PropertyType::SessionExpiryInterval as u8);
-            buffer.put_u32(session_expiry_interval);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.session_expiry_interval.is_some())
+            + usize::from(self.receive_max.is_some())
+            + usize::from(self.max_qos.is_some())
+            + usize::from(self.retain_available.is_some())
+            + usize::from(self.max_packet_size.is_some())
+            + usize::from(self.assigned_client_identifier.is_some())
+            + usize::from(self.topic_alias_max.is_some())
+            + usize::from(self.reason_string.is_some())
+            + self.user_properties.len()
+            + usize::from(self.wildcard_subscription_available.is_some())
+            + usize::from(self.subscription_identifiers_available.is_some())
+            + usize::from(self.shared_subscription_available.is_some())
+            + usize::from(self.server_keep_alive.is_some())
+            + usize::from(self.response_information.is_some())
+            + usize::from(self.server_reference.is_some())
+            + usize::from(self.authentication_method.is_some())
+            + usize::from(self.authentication_data.is_some());
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(receive_maximum) = self.receive_max {
-            buffer.put_u8(PropertyType::ReceiveMaximum as u8);
-            buffer.put_u16(receive_maximum);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.session_expiry_interval {
+            values.push((17, Property::Integer(*value)));
         }
-
-        if let Some(qos) = self.max_qos {
-            buffer.put_u8(PropertyType::MaximumQos as u8);
-            buffer.put_u8(qos);
+        if let Some(value) = &self.receive_max {
+            values.push((33, Property::Short(*value)));
         }
-
-        if let Some(retain_available) = self.retain_available {
-            buffer.put_u8(PropertyType::RetainAvailable as u8);
-            buffer.put_u8(retain_available);
+        if let Some(value) = &self.max_qos {
+            values.push((36, Property::Byte(*value)));
         }
-
-        if let Some(max_packet_size) = self.max_packet_size {
-            buffer.put_u8(PropertyType::MaximumPacketSize as u8);
-            buffer.put_u32(max_packet_size);
+        if let Some(value) = &self.retain_available {
+            values.push((37, Property::Byte(*value)));
         }
-
-        if let Some(id) = &self.assigned_client_identifier {
-            buffer.put_u8(PropertyType::AssignedClientIdentifier as u8);
-            write_mqtt_string(buffer, id);
+        if let Some(value) = &self.max_packet_size {
+            values.push((39, Property::Integer(*value)));
         }
-
-        if let Some(topic_alias_max) = self.topic_alias_max {
-            buffer.put_u8(PropertyType::TopicAliasMaximum as u8);
-            buffer.put_u16(topic_alias_max);
+        if let Some(value) = &self.assigned_client_identifier {
+            values.push((18, Property::String(value)));
         }
-
-        if let Some(reason) = &self.reason_string {
-            buffer.put_u8(PropertyType::ReasonString as u8);
-            write_mqtt_string(buffer, reason);
+        if let Some(value) = &self.topic_alias_max {
+            values.push((34, Property::Short(*value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.reason_string {
+            values.push((31, Property::String(value)));
         }
-
-        if let Some(w) = self.wildcard_subscription_available {
-            buffer.put_u8(PropertyType::WildcardSubscriptionAvailable as u8);
-            buffer.put_u8(w);
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
         }
-
-        if let Some(s) = self.subscription_identifiers_available {
-            buffer.put_u8(PropertyType::SubscriptionIdentifierAvailable as u8);
-            buffer.put_u8(s);
+        if let Some(value) = &self.wildcard_subscription_available {
+            values.push((40, Property::Byte(*value)));
         }
-
-        if let Some(s) = self.shared_subscription_available {
-            buffer.put_u8(PropertyType::SharedSubscriptionAvailable as u8);
-            buffer.put_u8(s);
+        if let Some(value) = &self.subscription_identifiers_available {
+            values.push((41, Property::Byte(*value)));
         }
-
-        if let Some(keep_alive) = self.server_keep_alive {
-            buffer.put_u8(PropertyType::ServerKeepAlive as u8);
-            buffer.put_u16(keep_alive);
+        if let Some(value) = &self.shared_subscription_available {
+            values.push((42, Property::Byte(*value)));
         }
-
-        if let Some(info) = &self.response_information {
-            buffer.put_u8(PropertyType::ResponseInformation as u8);
-            write_mqtt_string(buffer, info);
+        if let Some(value) = &self.server_keep_alive {
+            values.push((19, Property::Short(*value)));
         }
-
-        if let Some(reference) = &self.server_reference {
-            buffer.put_u8(PropertyType::ServerReference as u8);
-            write_mqtt_string(buffer, reference);
+        if let Some(value) = &self.response_information {
+            values.push((26, Property::String(value)));
         }
-
-        if let Some(authentication_method) = &self.authentication_method {
-            buffer.put_u8(PropertyType::AuthenticationMethod as u8);
-            write_mqtt_string(buffer, authentication_method);
+        if let Some(value) = &self.server_reference {
+            values.push((28, Property::String(value)));
         }
-
-        if let Some(authentication_data) = &self.authentication_data {
-            buffer.put_u8(PropertyType::AuthenticationData as u8);
-            write_mqtt_bytes(buffer, authentication_data);
+        if let Some(value) = &self.authentication_method {
+            values.push((21, Property::String(value)));
         }
-
-        Ok(())
+        if let Some(value) = &self.authentication_data {
+            values.push((22, Property::Binary(value)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 
