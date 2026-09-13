@@ -1,7 +1,7 @@
 use super::mqttbytes::v5::{
     ConnAck, ConnectReturnCode, Disconnect, DisconnectReasonCode, Packet, PingReq, PubAck,
-    PubAckReason, PubComp, PubCompReason, PubRec, PubRecReason, PubRel, PubRelReason, Publish,
-    SubAck, Subscribe, SubscribeReasonCode, UnsubAck, UnsubAckReason, Unsubscribe,
+    PubAckReason, PubComp, PubCompReason, PubRec, PubRel, Publish, SubAck, Subscribe,
+    SubscribeReasonCode, UnsubAck, Unsubscribe,
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
 
@@ -23,6 +23,9 @@ pub enum StateError {
     /// Invalid state for a given operation
     #[error("Invalid state for a given operation")]
     InvalidState,
+    /// No send quota or unused packet identifier remains.
+    #[error("MQTT outgoing capacity is occupied")]
+    OutgoingCapacity,
     /// Received a packet (ack) which isn't asked for
     #[error("Received unsolicited ack pkid: {0}")]
     Unsolicited(u16),
@@ -110,6 +113,17 @@ pub struct MqttState {
     pub(crate) max_outgoing_inflight: u16,
     /// Upper limit on the maximum number of allowed inflight QoS1 & QoS2 requests
     max_outgoing_inflight_upper_limit: u16,
+    incoming_ack: FixedBitSet,
+    incoming_rec: FixedBitSet,
+    incoming_done: HashMap<usize, u64>,
+    next_completion: u64,
+    outgoing_sub: HashMap<u16, Vec<QoS>>,
+    outgoing_unsub: HashMap<u16, usize>,
+    outgoing_aliases: HashMap<u16, Bytes>,
+    receive_maximum: usize,
+    receive_alias_maximum: u16,
+    alias_bytes_maximum: usize,
+    defer_write_completion: bool,
 }
 
 impl MqttState {
@@ -137,6 +151,17 @@ impl MqttState {
             broker_topic_alias_max: 0,
             max_outgoing_inflight: max_inflight,
             max_outgoing_inflight_upper_limit: max_inflight,
+            incoming_ack: FixedBitSet::with_capacity(65536),
+            incoming_rec: FixedBitSet::with_capacity(65536),
+            incoming_done: HashMap::new(),
+            next_completion: 0,
+            outgoing_sub: HashMap::new(),
+            outgoing_unsub: HashMap::new(),
+            outgoing_aliases: HashMap::new(),
+            receive_maximum: 65535,
+            receive_alias_maximum: 0,
+            alias_bytes_maximum: 16 * 1024 * 1024,
+            defer_write_completion: false,
         }
     }
 
@@ -160,6 +185,13 @@ impl MqttState {
 
         // remove packed ids of incoming qos2 publishes
         self.incoming_pub.clear();
+        self.incoming_ack.clear();
+        self.incoming_rec.clear();
+        self.incoming_done.clear();
+        self.outgoing_sub.clear();
+        self.outgoing_unsub.clear();
+        self.topic_alises.clear();
+        self.outgoing_aliases.clear();
 
         self.await_pingresp = false;
         self.collision_ping_count = 0;
@@ -188,7 +220,7 @@ impl MqttState {
             }
             Request::PubAck(puback) => self.outgoing_puback(puback)?,
             Request::PubRec(pubrec) => self.outgoing_pubrec(pubrec)?,
-            _ => unimplemented!(),
+            _ => return Err(StateError::WrongPacket),
         };
 
         self.last_outgoing = Instant::now();
@@ -203,7 +235,8 @@ impl MqttState {
         &mut self,
         mut packet: Incoming,
     ) -> Result<Option<Packet>, StateError> {
-        self.events.push_back(Event::Incoming(packet.to_owned()));
+        let duplicate = matches!(&packet, Incoming::Publish(p) if p.qos == QoS::ExactlyOnce && self.incoming_pub.contains(p.pkid as usize));
+        let event_index = self.events.len();
 
         let outgoing = match &mut packet {
             Incoming::PingResp(_) => self.handle_incoming_pingresp()?,
@@ -222,6 +255,9 @@ impl MqttState {
             }
         };
 
+        if !duplicate {
+            self.events.insert(event_index, Event::Incoming(packet));
+        }
         self.last_incoming = Instant::now();
         Ok(outgoing)
     }
@@ -235,16 +271,19 @@ impl MqttState {
         &mut self,
         suback: &mut SubAck,
     ) -> Result<Option<Packet>, StateError> {
-        for reason in suback.return_codes.iter() {
-            match reason {
-                SubscribeReasonCode::Success(qos) => {
-                    debug!("SubAck Pkid = {:?}, QoS = {:?}", suback.pkid, qos);
-                }
-                _ => {
-                    warn!("SubAck Pkid = {:?}, Reason = {:?}", suback.pkid, reason);
-                }
-            }
+        let requested = self
+            .outgoing_sub
+            .get(&suback.pkid)
+            .ok_or(StateError::Unsolicited(suback.pkid))?;
+        if requested.len() != suback.return_codes.len()
+            || requested
+                .iter()
+                .zip(&suback.return_codes)
+                .any(|(q, c)| matches!(c, SubscribeReasonCode::Success(v) if *v as u8 > *q as u8))
+        {
+            return Err(StateError::WrongPacket);
         }
+        self.outgoing_sub.remove(&suback.pkid);
         Ok(None)
     }
 
@@ -252,11 +291,10 @@ impl MqttState {
         &mut self,
         unsuback: &mut UnsubAck,
     ) -> Result<Option<Packet>, StateError> {
-        for reason in unsuback.reasons.iter() {
-            if reason != &UnsubAckReason::Success {
-                warn!("UnsubAck Pkid = {:?}, Reason = {:?}", unsuback.pkid, reason);
-            }
+        if self.outgoing_unsub.get(&unsuback.pkid).copied() != Some(unsuback.reasons.len()) {
+            return Err(StateError::Unsolicited(unsuback.pkid));
         }
+        self.outgoing_unsub.remove(&unsuback.pkid);
         Ok(None)
     }
 
@@ -307,41 +345,74 @@ impl MqttState {
         &mut self,
         publish: &mut Publish,
     ) -> Result<Option<Packet>, StateError> {
-        let qos = publish.qos;
-
-        let topic_alias = match &publish.properties {
-            Some(props) => props.topic_alias,
-            None => None,
-        };
-
-        if !publish.topic.is_empty() {
-            if let Some(alias) = topic_alias {
-                self.topic_alises.insert(alias, publish.topic.clone());
+        let id = publish.pkid as usize;
+        let alias = publish.properties.as_ref().and_then(|p| p.topic_alias);
+        if let Some(alias) = alias {
+            if alias == 0 || alias > self.receive_alias_maximum {
+                return Err(StateError::InvalidAlias {
+                    alias,
+                    max: self.receive_alias_maximum,
+                });
             }
-        } else if let Some(alias) = topic_alias {
-            if let Some(topic) = self.topic_alises.get(&alias) {
-                topic.clone_into(&mut publish.topic);
+            if publish.topic.is_empty() {
+                publish.topic = self
+                    .topic_alises
+                    .get(&alias)
+                    .cloned()
+                    .ok_or(StateError::InvalidState)?;
             } else {
-                self.handle_protocol_error()?;
-            };
+                Self::insert_alias(
+                    &mut self.topic_alises,
+                    alias,
+                    Bytes::copy_from_slice(&publish.topic),
+                    self.alias_bytes_maximum,
+                )?;
+            }
         }
-
-        match qos {
+        if publish.topic.is_empty() || std::str::from_utf8(&publish.topic).is_err() {
+            return Err(StateError::WrongPacket);
+        }
+        if publish.qos == QoS::AtMostOnce {
+            return Ok(None);
+        }
+        if id == 0 {
+            return Err(StateError::WrongPacket);
+        }
+        let known = self.incoming_pub.contains(id) || self.incoming_ack.contains(id);
+        if !known && self.incoming_inflight() >= self.receive_maximum {
+            return Err(StateError::InvalidState);
+        }
+        match publish.qos {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
-                if !self.manual_acks {
-                    let puback = PubAck::new(publish.pkid, None);
-                    return self.outgoing_puback(puback);
+                if self.incoming_pub.contains(id)
+                    || (self.incoming_ack.contains(id) && !publish.dup)
+                {
+                    return Err(StateError::WrongPacket);
+                }
+                self.incoming_ack.insert(id);
+                if !self.manual_acks && !self.incoming_done.contains_key(&id) {
+                    return self.outgoing_puback(PubAck::new(publish.pkid, None));
                 }
                 Ok(None)
             }
             QoS::ExactlyOnce => {
-                let pkid = publish.pkid;
-                self.incoming_pub.insert(pkid as usize);
-
+                if self.incoming_ack.contains(id) {
+                    return Err(StateError::WrongPacket);
+                }
+                if self.incoming_pub.contains(id) {
+                    if !publish.dup || self.incoming_done.contains_key(&id) {
+                        return Err(StateError::WrongPacket);
+                    }
+                    if self.incoming_rec.contains(id) {
+                        return Ok(None);
+                    }
+                    return self.outgoing_pubrec(PubRec::new(publish.pkid, None));
+                }
+                self.incoming_pub.insert(id);
+                self.incoming_rec.insert(id);
                 if !self.manual_acks {
-                    let pubrec = PubRec::new(pkid, None);
-                    return self.outgoing_pubrec(pubrec);
+                    return self.outgoing_pubrec(PubRec::new(publish.pkid, None));
                 }
                 Ok(None)
             }
@@ -354,11 +425,12 @@ impl MqttState {
             .get_mut(puback.pkid as usize)
             .ok_or(StateError::Unsolicited(puback.pkid))?;
 
-        if publish.take().is_none() {
+        if !publish.as_ref().is_some_and(|p| p.qos == QoS::AtLeastOnce) {
             error!("Unsolicited puback packet: {:?}", puback.pkid);
             return Err(StateError::Unsolicited(puback.pkid));
         }
 
+        publish.take();
         self.inflight -= 1;
 
         if puback.reason != PubAckReason::Success
@@ -387,56 +459,57 @@ impl MqttState {
     }
 
     fn handle_incoming_pubrec(&mut self, pubrec: &PubRec) -> Result<Option<Packet>, StateError> {
-        let publish = self
+        let id = pubrec.pkid as usize;
+        let reason = u8::from(pubrec.reason);
+        if self.outgoing_rel.contains(id) {
+            if reason >= 128 {
+                return Err(StateError::WrongPacket);
+            }
+            return Ok(Some(Packet::PubRel(PubRel::new(pubrec.pkid, None))));
+        }
+        let slot = self
             .outgoing_pub
-            .get_mut(pubrec.pkid as usize)
+            .get_mut(id)
             .ok_or(StateError::Unsolicited(pubrec.pkid))?;
-
-        if publish.take().is_none() {
-            error!("Unsolicited pubrec packet: {:?}", pubrec.pkid);
+        if !slot.as_ref().is_some_and(|p| p.qos == QoS::ExactlyOnce) {
             return Err(StateError::Unsolicited(pubrec.pkid));
         }
-
-        if pubrec.reason != PubRecReason::Success
-            && pubrec.reason != PubRecReason::NoMatchingSubscribers
-        {
-            warn!(
-                "PubRec Pkid = {:?}, reason: {:?}",
-                pubrec.pkid, pubrec.reason
-            );
+        slot.take();
+        if reason >= 128 {
+            self.inflight -= 1;
             return Ok(None);
         }
-
-        // NOTE: Inflight - 1 for qos2 in comp
-        self.outgoing_rel.insert(pubrec.pkid as usize);
-        let event = Event::Outgoing(Outgoing::PubRel(pubrec.pkid));
-        self.events.push_back(event);
-
+        self.outgoing_rel.insert(id);
+        self.events
+            .push_back(Event::Outgoing(Outgoing::PubRel(pubrec.pkid)));
         Ok(Some(Packet::PubRel(PubRel::new(pubrec.pkid, None))))
     }
 
     fn handle_incoming_pubrel(&mut self, pubrel: &PubRel) -> Result<Option<Packet>, StateError> {
-        if !self.incoming_pub.contains(pubrel.pkid as usize) {
-            error!("Unsolicited pubrel packet: {:?}", pubrel.pkid);
-            return Err(StateError::Unsolicited(pubrel.pkid));
+        let id = pubrel.pkid as usize;
+        if id == 0 || self.incoming_rec.contains(id) || self.incoming_ack.contains(id) {
+            return Err(StateError::WrongPacket);
         }
-        self.incoming_pub.set(pubrel.pkid as usize, false);
-
-        if pubrel.reason != PubRelReason::Success {
-            warn!(
-                "PubRel Pkid = {:?}, reason: {:?}",
-                pubrel.pkid, pubrel.reason
-            );
-            return Ok(None);
+        let known = self.incoming_pub.contains(id);
+        if known {
+            let token = self.mark_completing(id)?;
+            if !self.defer_write_completion {
+                self.acknowledgement_written(token);
+            }
         }
-
-        let event = Event::Outgoing(Outgoing::PubComp(pubrel.pkid));
-        self.events.push_back(event);
-
-        Ok(Some(Packet::PubComp(PubComp::new(pubrel.pkid, None))))
+        let mut packet = PubComp::new(pubrel.pkid, None);
+        if !known {
+            packet.reason = PubCompReason::PacketIdentifierNotFound;
+        }
+        self.events
+            .push_back(Event::Outgoing(Outgoing::PubComp(pubrel.pkid)));
+        Ok(Some(Packet::PubComp(packet)))
     }
 
     fn handle_incoming_pubcomp(&mut self, pubcomp: &PubComp) -> Result<Option<Packet>, StateError> {
+        if !self.outgoing_rel.contains(pubcomp.pkid as usize) {
+            return Err(StateError::Unsolicited(pubcomp.pkid));
+        }
         let outgoing = self.check_collision(pubcomp.pkid).map(|publish| {
             let pkid = publish.pkid;
             let event = Event::Outgoing(Outgoing::Publish(pkid));
@@ -452,6 +525,7 @@ impl MqttState {
         }
         self.outgoing_rel.set(pubcomp.pkid as usize, false);
 
+        self.inflight -= 1;
         if pubcomp.reason != PubCompReason::Success {
             warn!(
                 "PubComp Pkid = {:?}, reason: {:?}",
@@ -460,11 +534,13 @@ impl MqttState {
             return Ok(None);
         }
 
-        self.inflight -= 1;
         Ok(outgoing)
     }
 
     fn handle_incoming_pingresp(&mut self) -> Result<Option<Packet>, StateError> {
+        if !self.await_pingresp {
+            return Err(StateError::WrongPacket);
+        }
         self.await_pingresp = false;
         Ok(None)
     }
@@ -472,12 +548,43 @@ impl MqttState {
     /// Adds next packet identifier to QoS 1 and 2 publish packets and returns
     /// it buy wrapping publish in packet
     fn outgoing_publish(&mut self, mut publish: Publish) -> Result<Option<Packet>, StateError> {
+        if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
+            if alias == 0 || alias > self.broker_topic_alias_max {
+                return Err(StateError::InvalidAlias {
+                    alias,
+                    max: self.broker_topic_alias_max,
+                });
+            }
+            if publish.topic.is_empty() && !self.outgoing_aliases.contains_key(&alias) {
+                return Err(StateError::InvalidState);
+            }
+        }
+        if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
+            if !publish.topic.is_empty() {
+                Self::check_alias(
+                    &self.outgoing_aliases,
+                    alias,
+                    &publish.topic,
+                    self.alias_bytes_maximum,
+                )?;
+            }
+        }
+        if publish.qos != QoS::AtMostOnce && self.inflight >= self.max_outgoing_inflight {
+            return Err(StateError::OutgoingCapacity);
+        }
+
         if publish.qos != QoS::AtMostOnce {
             if publish.pkid == 0 {
-                publish.pkid = self.next_pkid();
+                publish.pkid = self.next_available_packet_id()?;
             }
 
             let pkid = publish.pkid;
+            if self.outgoing_rel.contains(pkid as usize)
+                || self.outgoing_sub.contains_key(&pkid)
+                || self.outgoing_unsub.contains_key(&pkid)
+            {
+                return Err(StateError::InvalidState);
+            }
             if self
                 .outgoing_pub
                 .get(publish.pkid as usize)
@@ -499,25 +606,19 @@ impl MqttState {
 
         debug!(
             "Publish. Topic = {}, Pkid = {:?}, Payload Size = {:?}",
-            String::from_utf8(publish.topic.to_vec()).unwrap(),
+            String::from_utf8_lossy(&publish.topic),
             publish.pkid,
             publish.payload.len()
         );
 
         let pkid = publish.pkid;
 
-        if let Some(props) = &publish.properties {
-            if let Some(alias) = props.topic_alias {
-                if alias > self.broker_topic_alias_max {
-                    // We MUST NOT send a Topic Alias that is greater than the
-                    // broker's Topic Alias Maximum.
-                    return Err(StateError::InvalidAlias {
-                        alias,
-                        max: self.broker_topic_alias_max,
-                    });
-                }
+        if let Some(alias) = publish.properties.as_ref().and_then(|p| p.topic_alias) {
+            if !publish.topic.is_empty() {
+                self.outgoing_aliases
+                    .insert(alias, Bytes::copy_from_slice(&publish.topic));
             }
-        };
+        }
 
         let event = Event::Outgoing(Outgoing::Publish(pkid));
         self.events.push_back(event);
@@ -537,18 +638,33 @@ impl MqttState {
     }
 
     fn outgoing_puback(&mut self, puback: PubAck) -> Result<Option<Packet>, StateError> {
-        let pkid = puback.pkid;
-        let event = Event::Outgoing(Outgoing::PubAck(pkid));
-        self.events.push_back(event);
-
+        let id = puback.pkid as usize;
+        if id == 0 || !self.incoming_ack.contains(id) || self.incoming_done.contains_key(&id) {
+            return Err(StateError::Unsolicited(puback.pkid));
+        }
+        let token = self.mark_completing(id)?;
+        if !self.defer_write_completion {
+            self.acknowledgement_written(token);
+        }
+        self.events
+            .push_back(Event::Outgoing(Outgoing::PubAck(puback.pkid)));
         Ok(Some(Packet::PubAck(puback)))
     }
 
     fn outgoing_pubrec(&mut self, pubrec: PubRec) -> Result<Option<Packet>, StateError> {
-        let pkid = pubrec.pkid;
-        let event = Event::Outgoing(Outgoing::PubRec(pkid));
-        self.events.push_back(event);
-
+        let id = pubrec.pkid as usize;
+        if id == 0 || !self.incoming_pub.contains(id) || self.incoming_done.contains_key(&id) {
+            return Err(StateError::Unsolicited(pubrec.pkid));
+        }
+        self.incoming_rec.set(id, false);
+        if u8::from(pubrec.reason) >= 128 {
+            let token = self.mark_completing(id)?;
+            if !self.defer_write_completion {
+                self.acknowledgement_written(token);
+            }
+        }
+        self.events
+            .push_back(Event::Outgoing(Outgoing::PubRec(pubrec.pkid)));
         Ok(Some(Packet::PubRec(pubrec)))
     }
 
@@ -591,19 +707,12 @@ impl MqttState {
         if subscription.filters.is_empty() {
             return Err(StateError::EmptySubscription);
         }
-
-        let pkid = self.next_pkid();
-        subscription.pkid = pkid;
-
-        debug!(
-            "Subscribe. Topics = {:?}, Pkid = {:?}",
-            subscription.filters, subscription.pkid
-        );
-
-        let pkid = subscription.pkid;
-        let event = Event::Outgoing(Outgoing::Subscribe(pkid));
-        self.events.push_back(event);
-
+        let id = self.next_available_packet_id()?;
+        subscription.pkid = id;
+        self.outgoing_sub
+            .insert(id, subscription.filters.iter().map(|f| f.qos).collect());
+        self.events
+            .push_back(Event::Outgoing(Outgoing::Subscribe(id)));
         Ok(Some(Packet::Subscribe(subscription)))
     }
 
@@ -611,18 +720,14 @@ impl MqttState {
         &mut self,
         mut unsub: Unsubscribe,
     ) -> Result<Option<Packet>, StateError> {
-        let pkid = self.next_pkid();
-        unsub.pkid = pkid;
-
-        debug!(
-            "Unsubscribe. Topics = {:?}, Pkid = {:?}",
-            unsub.filters, unsub.pkid
-        );
-
-        let pkid = unsub.pkid;
-        let event = Event::Outgoing(Outgoing::Unsubscribe(pkid));
-        self.events.push_back(event);
-
+        if unsub.filters.is_empty() {
+            return Err(StateError::EmptySubscription);
+        }
+        let id = self.next_available_packet_id()?;
+        unsub.pkid = id;
+        self.outgoing_unsub.insert(id, unsub.filters.len());
+        self.events
+            .push_back(Event::Outgoing(Outgoing::Unsubscribe(id)));
         Ok(Some(Packet::Unsubscribe(unsub)))
     }
 
@@ -679,6 +784,247 @@ impl MqttState {
 
         self.last_pkid = next_pkid;
         next_pkid
+    }
+}
+
+impl MqttState {
+    pub fn initial_memory_bound(maximum: u16) -> usize {
+        let slots = maximum as usize + 1;
+        std::mem::size_of::<Self>()
+            + slots * std::mem::size_of::<Option<Publish>>()
+            + (slots + 7) / 8
+            + 256
+            + 3 * (8192 + 64)
+            + 100 * std::mem::size_of::<Event>()
+    }
+    pub fn pending(&self) -> bool {
+        self.inflight != 0 || !self.outgoing_sub.is_empty() || !self.outgoing_unsub.is_empty()
+    }
+    pub fn incoming_inflight(&self) -> usize {
+        self.incoming_ack.count_ones(..) + self.incoming_pub.count_ones(..)
+    }
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.outgoing_pub.capacity() * std::mem::size_of::<Option<Publish>>()
+            + self
+                .outgoing_pub
+                .iter()
+                .flatten()
+                .map(Self::publication_memory_bound)
+                .sum::<usize>()
+            + [
+                &self.outgoing_rel,
+                &self.incoming_pub,
+                &self.incoming_ack,
+                &self.incoming_rec,
+            ]
+            .iter()
+            .map(|s| std::mem::size_of_val(s.as_slice()))
+            .sum::<usize>()
+            + self
+                .outgoing_sub
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<QoS>())
+                .sum::<usize>()
+            + (self.outgoing_sub.capacity()
+                + self.outgoing_unsub.capacity()
+                + self.incoming_done.capacity()
+                + self.topic_alises.capacity()
+                + self.outgoing_aliases.capacity())
+                * 128
+            + self
+                .topic_alises
+                .values()
+                .chain(self.outgoing_aliases.values())
+                .map(|v| v.len())
+                .sum::<usize>()
+            + self.events.capacity() * std::mem::size_of::<Event>()
+    }
+    /// Conservative owned heap estimate; property containers can exceed wire size.
+    pub fn publication_memory_bound(p: &Publish) -> usize {
+        p.topic.len()
+            + p.payload.len()
+            + p.properties.as_ref().map_or(0, |v| {
+                v.response_topic.as_ref().map_or(0, String::capacity)
+                    + v.content_type.as_ref().map_or(0, String::capacity)
+                    + v.correlation_data.as_ref().map_or(0, Bytes::len)
+                    + v.user_properties.capacity() * std::mem::size_of::<(String, String)>()
+                    + v.user_properties
+                        .iter()
+                        .map(|(k, v)| k.capacity() + v.capacity())
+                        .sum::<usize>()
+                    + v.subscription_identifiers.capacity() * std::mem::size_of::<usize>()
+            })
+    }
+    /// A caller may reject this bound before changing protocol state. Estimates
+    /// include hash-table growth, not just the bytes represented on the wire.
+    pub fn outgoing_memory_bound(&self, request: &Request) -> usize {
+        let extra = match request {
+            Request::Publish(p) => {
+                Self::publication_memory_bound(p)
+                    + p.properties
+                        .as_ref()
+                        .and_then(|v| v.topic_alias)
+                        .filter(|_| !p.topic.is_empty())
+                        .map_or(0, |id| {
+                            p.topic.len() + Self::map_growth(&self.outgoing_aliases, &id)
+                        })
+            }
+            Request::Subscribe(p) => {
+                p.filters.len() * std::mem::size_of::<QoS>()
+                    + Self::map_insert_growth(&self.outgoing_sub)
+            }
+            Request::Unsubscribe(_) => Self::map_insert_growth(&self.outgoing_unsub),
+            Request::PubAck(p) => Self::map_growth(&self.incoming_done, &(p.pkid as usize)),
+            Request::PubRec(p) if u8::from(p.reason) >= 128 => {
+                Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+            }
+            _ => 0,
+        };
+        self.retained_bytes()
+            .saturating_add(extra)
+            .saturating_add(1024)
+    }
+    pub fn incoming_memory_bound(&self, packet: &Packet) -> usize {
+        let extra = match packet {
+            Packet::Publish(p) => {
+                let alias = p
+                    .properties
+                    .as_ref()
+                    .and_then(|v| v.topic_alias)
+                    .filter(|_| !p.topic.is_empty())
+                    .map_or(0, |id| {
+                        p.topic.len() + Self::map_growth(&self.topic_alises, &id)
+                    });
+                alias + Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+            }
+            Packet::PubRel(p) => Self::map_growth(&self.incoming_done, &(p.pkid as usize)),
+            _ => 0,
+        };
+        self.retained_bytes()
+            .saturating_add(extra)
+            .saturating_add(1024)
+    }
+    fn map_growth<K: Eq + std::hash::Hash, V>(map: &HashMap<K, V>, key: &K) -> usize {
+        if map.contains_key(key) {
+            0
+        } else {
+            Self::map_insert_growth(map)
+        }
+    }
+    fn map_insert_growth<K, V>(map: &HashMap<K, V>) -> usize {
+        if map.len() < map.capacity() {
+            0
+        } else {
+            map.capacity().saturating_add(4).saturating_mul(256)
+        }
+    }
+    pub fn configure_receive(
+        &mut self,
+        maximum: u16,
+        aliases: u16,
+        alias_bytes: usize,
+        defer_write_completion: bool,
+    ) -> Result<(), StateError> {
+        if maximum == 0 || alias_bytes == 0 || self.incoming_inflight() != 0 {
+            return Err(StateError::InvalidState);
+        }
+        self.receive_maximum = maximum as usize;
+        self.receive_alias_maximum = aliases;
+        self.alias_bytes_maximum = alias_bytes;
+        self.defer_write_completion = defer_write_completion;
+        Ok(())
+    }
+    pub fn next_available_packet_id(&mut self) -> Result<u16, StateError> {
+        for _ in 0..self.max_outgoing_inflight_upper_limit {
+            self.last_pkid = if self.last_pkid >= self.max_outgoing_inflight_upper_limit {
+                1
+            } else {
+                self.last_pkid + 1
+            };
+            let id = self.last_pkid;
+            if self.outgoing_pub[id as usize].is_none()
+                && !self.outgoing_rel.contains(id as usize)
+                && !self.outgoing_sub.contains_key(&id)
+                && !self.outgoing_unsub.contains_key(&id)
+            {
+                if id == self.max_outgoing_inflight_upper_limit {
+                    self.last_pkid = 0;
+                }
+                return Ok(id);
+            }
+        }
+        Err(StateError::OutgoingCapacity)
+    }
+    pub fn acknowledgement_kind(&self, id: u16) -> Result<u8, StateError> {
+        let id = id as usize;
+        if !self.manual_acks || self.incoming_done.contains_key(&id) {
+            return Err(StateError::InvalidState);
+        }
+        if self.incoming_ack.contains(id) {
+            Ok(4)
+        } else if self.incoming_rec.contains(id) {
+            Ok(5)
+        } else {
+            Err(StateError::Unsolicited(id as u16))
+        }
+    }
+    fn mark_completing(&mut self, id: usize) -> Result<u64, StateError> {
+        if let Some(token) = self.incoming_done.get(&id) {
+            return Ok(*token);
+        }
+        self.next_completion = self
+            .next_completion
+            .checked_add(65536)
+            .ok_or(StateError::InvalidState)?;
+        let token = self.next_completion | id as u64;
+        self.incoming_done.insert(id, token);
+        Ok(token)
+    }
+    /// Physical write tokens remain distinct from reusable MQTT packet identifiers.
+    pub fn completion_token(&self, packet: &Packet) -> Option<u64> {
+        let id = match packet {
+            Packet::PubAck(p) => p.pkid,
+            Packet::PubRec(p) => p.pkid,
+            Packet::PubComp(p) => p.pkid,
+            _ => return None,
+        };
+        self.incoming_done.get(&(id as usize)).copied()
+    }
+    pub fn acknowledgement_written(&mut self, token: u64) {
+        let id = (token & 65535) as usize;
+        if self.incoming_done.get(&id) == Some(&token) {
+            self.incoming_done.remove(&id);
+            self.incoming_ack.set(id, false);
+            self.incoming_pub.set(id, false);
+            self.incoming_rec.set(id, false);
+        }
+    }
+    fn insert_alias(
+        map: &mut HashMap<u16, Bytes>,
+        alias: u16,
+        topic: Bytes,
+        maximum: usize,
+    ) -> Result<(), StateError> {
+        Self::check_alias(map, alias, &topic, maximum)?;
+        map.insert(alias, topic);
+        Ok(())
+    }
+    fn check_alias(
+        map: &HashMap<u16, Bytes>,
+        alias: u16,
+        topic: &Bytes,
+        maximum: usize,
+    ) -> Result<(), StateError> {
+        let bytes = map
+            .iter()
+            .filter(|(id, _)| **id != alias)
+            .map(|(_, value)| value.len())
+            .sum::<usize>();
+        if bytes.saturating_add(topic.len()) > maximum {
+            return Err(StateError::InvalidState);
+        }
+        Ok(())
     }
 }
 
@@ -784,20 +1130,21 @@ mod test {
         assert_eq!(mqtt.last_pkid, 0);
         assert_eq!(mqtt.inflight, 2);
 
-        // This should cause a collition
-        mqtt.outgoing_publish(publish.clone()).unwrap();
-        assert_eq!(mqtt.last_pkid, 1);
+        // Capacity is an explicit refusal; the state must not retain/replay it.
+        assert!(matches!(
+            mqtt.outgoing_publish(publish.clone()),
+            Err(StateError::OutgoingCapacity)
+        ));
         assert_eq!(mqtt.inflight, 2);
-        assert!(mqtt.collision.is_some());
-
-        mqtt.handle_incoming_puback(&PubAck::new(1, None)).unwrap();
-        mqtt.handle_incoming_puback(&PubAck::new(2, None)).unwrap();
+        assert!(mqtt.collision.is_none());
+        for id in [1, 2] {
+            mqtt.handle_incoming_pubrec(&PubRec::new(id, None)).unwrap();
+            mqtt.handle_incoming_pubcomp(&PubComp::new(id, None))
+                .unwrap();
+        }
+        assert_eq!(mqtt.inflight, 0);
+        mqtt.outgoing_publish(publish).unwrap();
         assert_eq!(mqtt.inflight, 1);
-
-        // Now there should be space in the outgoing queue
-        mqtt.outgoing_publish(publish.clone()).unwrap();
-        assert_eq!(mqtt.last_pkid, 0);
-        assert_eq!(mqtt.inflight, 2);
     }
 
     #[test]
@@ -877,7 +1224,7 @@ mod test {
         let mut mqtt = build_mqttstate();
 
         let publish1 = build_outgoing_publish(QoS::AtLeastOnce);
-        let publish2 = build_outgoing_publish(QoS::ExactlyOnce);
+        let publish2 = build_outgoing_publish(QoS::AtLeastOnce);
 
         mqtt.outgoing_publish(publish1).unwrap();
         mqtt.outgoing_publish(publish2).unwrap();

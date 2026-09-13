@@ -76,3 +76,25 @@ Validation: 73 library tests, 7 state regressions, 8 receive-codec regressions a
 5 writer regressions passed. IMAPipe's 17 MQTT tests (including isolated Mosquitto)
 passed after its outgoing codec was replaced with this library entry point.
 MQTT 5 state integration and explicit recovery remain separate required work.
+
+## MQTT 5 externally driven state
+
+The v5 `MqttState` now owns publication, subscription and unsubscription packet
+identifiers in one namespace; correlates acknowledgement kinds, subscription
+counts and granted QoS; and preserves negative terminal outcomes without replay.
+Incoming QoS 2 duplicates retain the manual acknowledgement boundary. The caller
+may defer receive-credit release until the emitted acknowledgement has actually
+been written, using a generation token that cannot clear a reused packet ID.
+Topic aliases use bounded owned topic bytes, independent of the received frame.
+
+The Runtime can inspect initial, retained and next-transition memory bounds before
+allocating or changing state. These bounds include collection growth and property
+allocations. Exhausted send capacity is an explicit error. The Runtime does not
+use the reconnecting EventLoop or implicit replay helpers. Explicit session
+recovery remains a separate required integration.
+
+Validation: 73 library tests, 7 MQTT 3 state regressions, 8 MQTT 5 receive-codec
+regressions, 5 MQTT 5 writer regressions and 7 MQTT 5 state/admission regressions
+passed. All 17 Runtime MQTT tests passed, including isolated Mosquitto for both
+versions, manual acknowledgement, negative QoS 2, frozen authentication,
+reauthentication privacy, cancellation and resource release.
