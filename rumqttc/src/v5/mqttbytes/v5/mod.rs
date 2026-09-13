@@ -332,6 +332,20 @@ pub struct FixedHeader {
 }
 
 impl FixedHeader {
+    /// Parse and validate a fixed header without waiting for its payload.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let header = parse_fixed_header(bytes.iter())?;
+        header.packet_type()?;
+        Ok(header)
+    }
+
+    pub fn header_length(&self) -> usize {
+        self.fixed_header_len
+    }
+    pub fn remaining_length(&self) -> usize {
+        self.remaining_len
+    }
+
     pub fn new(byte1: u8, remaining_len_len: usize, remaining_len: usize) -> FixedHeader {
         FixedHeader {
             byte1,

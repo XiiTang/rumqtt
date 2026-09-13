@@ -190,3 +190,11 @@ fn explicit_release_is_bounded_and_repeating_it_does_not_inflate_state() {
         .unwrap();
     assert!(!state.pending());
 }
+
+#[test]
+fn initial_allocation_bound_covers_actual_retained_state() {
+    for count in [0, 1, 2, 31, 128, 1024, u16::MAX] {
+        let state = MqttState::new(count, true);
+        assert!(state.retained_bytes() <= MqttState::initial_memory_bound(count));
+    }
+}
