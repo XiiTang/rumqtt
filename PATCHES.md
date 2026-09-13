@@ -30,3 +30,23 @@ Validation is intentionally scoped: run rumqttc's library tests and
 isolated Mosquitto tests for both versions. No claim is made that the unused
 reconnecting EventLoop or every optional transport has passed acceptance.
 MQTT 5 state/codec integration and explicit session recovery remain separate work.
+
+## MQTT 5 codec integration
+
+The second increment enables AUTH in the top-level decoder and corrects its
+binary/string lengths, multi-byte property length, and default short forms.
+Every property decoder now receives an isolated exact-length section. Its one
+parse loop enforces singleton/count bounds, preserves repeated identifiers, and
+can record original property ordering alongside existing typed fields. No second
+property parser was introduced. Control-property tails, canonical variable
+integers, fixed-header flags, CONNACK flags and NUL strings are checked.
+
+`Packet::read_with_property_order` and `read_frame_with_property_order` expose the
+same decoder for Runtime evidence conversion. The latter accepts an immutable
+frame so the caller can retain ownership, then reclaim and erase authentication
+bytes after dropping all borrowed decoded fields. Numeric reason conversions use
+the existing library tables. The public typed property structs are unchanged.
+
+Eight fixed-wire and boundary regressions are in `tests/runtime_v5_codec.rs`.
+The Runtime receive adapter uses this decoder and preserves original property
+order; MQTT 5 outgoing encoding/state and explicit recovery are still pending.

@@ -62,7 +62,15 @@ impl PubAck {
         len
     }
 
-    pub fn read(fixed_header: FixedHeader, mut bytes: Bytes) -> Result<PubAck, Error> {
+    pub fn read(fixed_header: FixedHeader, bytes: Bytes) -> Result<PubAck, Error> {
+        Self::read_traced(fixed_header, bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        fixed_header: FixedHeader,
+        mut bytes: Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<PubAck, Error> {
         let variable_header_index = fixed_header.fixed_header_len;
         bytes.advance(variable_header_index);
         let pkid = read_u16(&mut bytes)?;
@@ -86,13 +94,16 @@ impl PubAck {
             });
         }
 
-        let properties = PubAckProperties::read(&mut bytes)?;
+        let properties = PubAckProperties::read_traced(&mut bytes, order)?;
         let puback = PubAck {
             pkid,
             reason: reason(ack_reason)?,
             properties,
         };
 
+        if !bytes.is_empty() {
+            return Err(Error::MalformedPacket);
+        }
         Ok(puback)
     }
 
@@ -141,31 +152,39 @@ impl PubAckProperties {
     }
 
     pub fn read(bytes: &mut Bytes) -> Result<Option<PubAckProperties>, Error> {
+        Self::read_traced(bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<PubAckProperties>, Error> {
         let mut reason_string = None;
         let mut user_properties = Vec::new();
 
-        let (properties_len_len, properties_len) = length(bytes.iter())?;
-        bytes.advance(properties_len_len);
-        if properties_len == 0 {
+        let mut section = super::read_properties_section(bytes)?;
+        let bytes = &mut section;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
-        let mut cursor = 0;
-        // read until cursor reaches property length. properties_len = 0 will skip this loop
-        while cursor < properties_len {
+        let mut seen = 0u64;
+        let mut count = 0usize;
+        while bytes.has_remaining() {
             let prop = read_u8(bytes)?;
-            cursor += 1;
+            super::validate_property_occurrence(prop, prop == 38, &mut seen, &mut count)?;
+            order.push(prop);
 
             match property(prop)? {
                 PropertyType::ReasonString => {
                     let reason = read_mqtt_string(bytes)?;
-                    cursor += 2 + reason.len();
+
                     reason_string = Some(reason);
                 }
                 PropertyType::UserProperty => {
                     let key = read_mqtt_string(bytes)?;
                     let value = read_mqtt_string(bytes)?;
-                    cursor += 2 + key.len() + 2 + value.len();
+
                     user_properties.push((key, value));
                 }
                 _ => return Err(Error::InvalidPropertyType(prop)),
@@ -255,5 +274,17 @@ mod test {
 
         assert_eq!(size_from_write, size_from_bytes);
         assert_eq!(size_from_size, size_from_bytes);
+    }
+}
+
+impl From<PubAckReason> for u8 {
+    fn from(value: PubAckReason) -> Self {
+        code(value)
+    }
+}
+impl TryFrom<u8> for PubAckReason {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        reason(value)
     }
 }

@@ -1,7 +1,7 @@
 use std::slice::Iter;
 
 pub use self::{
-    auth::Auth,
+    auth::{Auth, AuthProperties, AuthReasonCode},
     codec::Codec,
     connack::{ConnAck, ConnAckProperties, ConnectReturnCode},
     connect::{Connect, ConnectProperties, LastWill, LastWillProperties, Login},
@@ -56,13 +56,74 @@ pub enum Packet {
     Disconnect(Disconnect),
 }
 
+/// Original order of decoded property identifiers. Repeated identifiers occur
+/// once per occurrence. Values remain in the corresponding typed property fields.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PropertyOrder {
+    pub packet: Vec<u8>,
+    pub will: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPacket {
+    pub packet: Packet,
+    pub property_order: PropertyOrder,
+}
+
 impl Packet {
     /// Reads a stream of bytes and extracts next MQTT packet out of it
     pub fn read(stream: &mut BytesMut, max_size: Option<u32>) -> Result<Packet, Error> {
+        Self::read_traced(stream, max_size, &mut PropertyOrder::default())
+    }
+
+    /// Decode once while retaining property ordering alongside the typed fields.
+    pub fn read_with_property_order(
+        stream: &mut BytesMut,
+        max_size: Option<u32>,
+    ) -> Result<DecodedPacket, Error> {
+        let mut property_order = PropertyOrder::default();
+        let packet = Self::read_traced(stream, max_size, &mut property_order)?;
+        Ok(DecodedPacket {
+            packet,
+            property_order,
+        })
+    }
+
+    /// Decode exactly one immutable frame. Borrowed fields share this allocation;
+    /// callers may retain an owner to reclaim/erase it after dropping the packet.
+    pub fn read_frame_with_property_order(
+        frame: Bytes,
+        max_size: Option<u32>,
+    ) -> Result<DecodedPacket, Error> {
+        let fixed_header = check(frame.iter(), max_size)?;
+        if fixed_header.frame_length() != frame.len() {
+            return Err(Error::MalformedPacket);
+        }
+        let mut property_order = PropertyOrder::default();
+        let packet = Self::decode_frame_traced(fixed_header, frame, &mut property_order)?;
+        Ok(DecodedPacket {
+            packet,
+            property_order,
+        })
+    }
+
+    fn read_traced(
+        stream: &mut BytesMut,
+        max_size: Option<u32>,
+        order: &mut PropertyOrder,
+    ) -> Result<Packet, Error> {
         let fixed_header = check(stream.iter(), max_size)?;
 
         // Test with a stream with exactly the size to check border panics
-        let packet = stream.split_to(fixed_header.frame_length());
+        let packet = stream.split_to(fixed_header.frame_length()).freeze();
+        Self::decode_frame_traced(fixed_header, packet, order)
+    }
+
+    fn decode_frame_traced(
+        fixed_header: FixedHeader,
+        packet: Bytes,
+        order: &mut PropertyOrder,
+    ) -> Result<Packet, Error> {
         let packet_type = fixed_header.packet_type()?;
 
         if fixed_header.remaining_len == 0 {
@@ -70,60 +131,70 @@ impl Packet {
             return match packet_type {
                 PacketType::PingReq => Ok(Packet::PingReq(PingReq)),
                 PacketType::PingResp => Ok(Packet::PingResp(PingResp)),
+                PacketType::Disconnect => Ok(Packet::Disconnect(Disconnect::new(
+                    DisconnectReasonCode::NormalDisconnection,
+                ))),
+                PacketType::Auth => Ok(Packet::Auth(Auth {
+                    code: AuthReasonCode::Success,
+                    properties: None,
+                })),
                 _ => Err(Error::PayloadRequired),
             };
         }
 
-        let packet = packet.freeze();
         let packet = match packet_type {
             PacketType::Connect => {
-                let (connect, will, login) = Connect::read(fixed_header, packet)?;
+                let (connect, will, login) =
+                    Connect::read_traced(fixed_header, packet, &mut order.packet, &mut order.will)?;
                 Packet::Connect(connect, will, login)
             }
             PacketType::Publish => {
-                let publish = Publish::read(fixed_header, packet)?;
+                let publish = Publish::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::Publish(publish)
             }
             PacketType::Subscribe => {
-                let subscribe = Subscribe::read(fixed_header, packet)?;
+                let subscribe = Subscribe::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::Subscribe(subscribe)
             }
             PacketType::Unsubscribe => {
-                let unsubscribe = Unsubscribe::read(fixed_header, packet)?;
+                let unsubscribe =
+                    Unsubscribe::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::Unsubscribe(unsubscribe)
             }
             PacketType::ConnAck => {
-                let connack = ConnAck::read(fixed_header, packet)?;
+                let connack = ConnAck::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::ConnAck(connack)
             }
             PacketType::PubAck => {
-                let puback = PubAck::read(fixed_header, packet)?;
+                let puback = PubAck::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::PubAck(puback)
             }
             PacketType::PubRec => {
-                let pubrec = PubRec::read(fixed_header, packet)?;
+                let pubrec = PubRec::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::PubRec(pubrec)
             }
             PacketType::PubRel => {
-                let pubrel = PubRel::read(fixed_header, packet)?;
+                let pubrel = PubRel::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::PubRel(pubrel)
             }
             PacketType::PubComp => {
-                let pubcomp = PubComp::read(fixed_header, packet)?;
+                let pubcomp = PubComp::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::PubComp(pubcomp)
             }
             PacketType::SubAck => {
-                let suback = SubAck::read(fixed_header, packet)?;
+                let suback = SubAck::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::SubAck(suback)
             }
             PacketType::UnsubAck => {
-                let unsuback = UnsubAck::read(fixed_header, packet)?;
+                let unsuback = UnsubAck::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::UnsubAck(unsuback)
             }
-            PacketType::PingReq => Packet::PingReq(PingReq),
-            PacketType::PingResp => Packet::PingResp(PingResp),
+            PacketType::PingReq | PacketType::PingResp => return Err(Error::MalformedPacket),
+            PacketType::Auth => {
+                Packet::Auth(Auth::read_traced(fixed_header, packet, &mut order.packet)?)
+            }
             PacketType::Disconnect => {
-                let disconnect = Disconnect::read(fixed_header, packet)?;
+                let disconnect = Disconnect::read_traced(fixed_header, packet, &mut order.packet)?;
                 Packet::Disconnect(disconnect)
             }
         };
@@ -199,6 +270,7 @@ pub enum PacketType {
     PingReq,
     PingResp,
     Disconnect,
+    Auth,
 }
 
 #[repr(u8)]
@@ -270,6 +342,14 @@ impl FixedHeader {
 
     pub fn packet_type(&self) -> Result<PacketType, Error> {
         let num = self.byte1 >> 4;
+        let flags = self.byte1 & 15;
+        if num == 3 {
+            if flags & 6 == 6 || flags & 6 == 0 && flags & 8 != 0 {
+                return Err(Error::MalformedPacket);
+            }
+        } else if flags != if matches!(num, 6 | 8 | 10) { 2 } else { 0 } {
+            return Err(Error::MalformedPacket);
+        }
         match num {
             1 => Ok(PacketType::Connect),
             2 => Ok(PacketType::ConnAck),
@@ -285,6 +365,7 @@ impl FixedHeader {
             12 => Ok(PacketType::PingReq),
             13 => Ok(PacketType::PingResp),
             14 => Ok(PacketType::Disconnect),
+            15 => Ok(PacketType::Auth),
             _ => Err(Error::InvalidPacketType(num)),
         }
     }
@@ -294,6 +375,34 @@ impl FixedHeader {
     pub fn frame_length(&self) -> usize {
         self.fixed_header_len + self.remaining_len
     }
+}
+
+// Isolate the declared property section before decoding any field. A malformed
+// field cannot consume bytes from a publish payload, client id or subscribe list.
+fn read_properties_section(bytes: &mut Bytes) -> Result<Bytes, Error> {
+    let (prefix, size) = length(bytes.iter())?;
+    if bytes.remaining() < prefix + size {
+        return Err(Error::MalformedPacket);
+    }
+    bytes.advance(prefix);
+    Ok(bytes.split_to(size))
+}
+
+fn validate_property_occurrence(
+    id: u8,
+    repeat: bool,
+    seen: &mut u64,
+    count: &mut usize,
+) -> Result<(), Error> {
+    if id >= 64 {
+        return Err(Error::InvalidPropertyType(id));
+    }
+    *count += 1;
+    if *count > 1024 || (!repeat && *seen & (1u64 << id) != 0) {
+        return Err(Error::MalformedPacket);
+    }
+    *seen |= 1u64 << id;
+    Ok(())
 }
 
 fn property(num: u8) -> Result<PropertyType, Error> {
@@ -398,6 +507,9 @@ fn length(stream: Iter<u8>) -> Result<(usize, usize), Error> {
         // stop when continue bit is 0
         done = (byte & 0x80) == 0;
         if done {
+            if len_len > 1 && byte == 0 {
+                return Err(Error::MalformedRemainingLength);
+            }
             break;
         }
 
@@ -438,7 +550,8 @@ fn read_mqtt_bytes(stream: &mut Bytes) -> Result<Bytes, Error> {
 fn read_mqtt_string(stream: &mut Bytes) -> Result<String, Error> {
     let s = read_mqtt_bytes(stream)?;
     match String::from_utf8(s.to_vec()) {
-        Ok(v) => Ok(v),
+        Ok(v) if !v.contains('\0') => Ok(v),
+        Ok(_) => Err(Error::MalformedPacket),
         Err(_e) => Err(Error::TopicNotUtf8),
     }
 }

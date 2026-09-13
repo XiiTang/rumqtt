@@ -17,7 +17,16 @@ impl Connect {
     #[allow(clippy::type_complexity)]
     pub fn read(
         fixed_header: FixedHeader,
+        bytes: Bytes,
+    ) -> Result<(Connect, Option<LastWill>, Option<Login>), Error> {
+        Self::read_traced(fixed_header, bytes, &mut Vec::new(), &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        fixed_header: FixedHeader,
         mut bytes: Bytes,
+        order: &mut Vec<u8>,
+        will_order: &mut Vec<u8>,
     ) -> Result<(Connect, Option<LastWill>, Option<Login>), Error> {
         let variable_header_index = fixed_header.fixed_header_len;
         bytes.advance(variable_header_index);
@@ -37,10 +46,10 @@ impl Connect {
         let clean_start = (connect_flags & 0b10) != 0;
         let keep_alive = read_u16(&mut bytes)?;
 
-        let properties = ConnectProperties::read(&mut bytes)?;
+        let properties = ConnectProperties::read_traced(&mut bytes, order)?;
 
         let client_id = read_mqtt_string(&mut bytes)?;
-        let will = LastWill::read(connect_flags, &mut bytes)?;
+        let will = LastWill::read_traced(connect_flags, &mut bytes, will_order)?;
         let login = Login::read(connect_flags, &mut bytes)?;
 
         let connect = Connect {
@@ -50,6 +59,9 @@ impl Connect {
             properties,
         };
 
+        if !bytes.is_empty() {
+            return Err(Error::MalformedPacket);
+        }
         Ok((connect, will, login))
     }
 
@@ -172,6 +184,13 @@ impl ConnectProperties {
     }
 
     pub fn read(bytes: &mut Bytes) -> Result<Option<ConnectProperties>, Error> {
+        Self::read_traced(bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<ConnectProperties>, Error> {
         let mut session_expiry_interval = None;
         let mut receive_maximum = None;
         let mut max_packet_size = None;
@@ -182,56 +201,52 @@ impl ConnectProperties {
         let mut authentication_method = None;
         let mut authentication_data = None;
 
-        let (properties_len_len, properties_len) = length(bytes.iter())?;
-        bytes.advance(properties_len_len);
-        if properties_len == 0 {
+        let mut section = super::read_properties_section(bytes)?;
+        let bytes = &mut section;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
-        let mut cursor = 0;
-        // read until cursor reaches property length. properties_len = 0 will skip this loop
-        while cursor < properties_len {
+        let mut seen = 0u64;
+        let mut count = 0usize;
+        while bytes.has_remaining() {
             let prop = read_u8(bytes)?;
-            cursor += 1;
+            super::validate_property_occurrence(prop, prop == 38, &mut seen, &mut count)?;
+            order.push(prop);
+
             match property(prop)? {
                 PropertyType::SessionExpiryInterval => {
                     session_expiry_interval = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::ReceiveMaximum => {
                     receive_maximum = Some(read_u16(bytes)?);
-                    cursor += 2;
                 }
                 PropertyType::MaximumPacketSize => {
                     max_packet_size = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::TopicAliasMaximum => {
                     topic_alias_max = Some(read_u16(bytes)?);
-                    cursor += 2;
                 }
                 PropertyType::RequestResponseInformation => {
                     request_response_info = Some(read_u8(bytes)?);
-                    cursor += 1;
                 }
                 PropertyType::RequestProblemInformation => {
                     request_problem_info = Some(read_u8(bytes)?);
-                    cursor += 1;
                 }
                 PropertyType::UserProperty => {
                     let key = read_mqtt_string(bytes)?;
                     let value = read_mqtt_string(bytes)?;
-                    cursor += 2 + key.len() + 2 + value.len();
+
                     user_properties.push((key, value));
                 }
                 PropertyType::AuthenticationMethod => {
                     let method = read_mqtt_string(bytes)?;
-                    cursor += 2 + method.len();
+
                     authentication_method = Some(method);
                 }
                 PropertyType::AuthenticationData => {
                     let data = read_mqtt_bytes(bytes)?;
-                    cursor += 2 + data.len();
+
                     authentication_data = Some(data);
                 }
                 _ => return Err(Error::InvalidPropertyType(prop)),
@@ -398,6 +413,14 @@ impl LastWill {
     }
 
     pub fn read(connect_flags: u8, bytes: &mut Bytes) -> Result<Option<LastWill>, Error> {
+        Self::read_traced(connect_flags, bytes, &mut Vec::new())
+    }
+
+    fn read_traced(
+        connect_flags: u8,
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<LastWill>, Error> {
         let o = match connect_flags & 0b100 {
             0 if (connect_flags & 0b0011_1000) != 0 => {
                 return Err(Error::IncorrectPacketFormat);
@@ -405,7 +428,7 @@ impl LastWill {
             0 => None,
             _ => {
                 // Properties in variable header
-                let properties = LastWillProperties::read(bytes)?;
+                let properties = LastWillProperties::read_traced(bytes, order)?;
 
                 let will_topic = read_mqtt_bytes(bytes)?;
                 let will_message = read_mqtt_bytes(bytes)?;
@@ -491,6 +514,13 @@ impl LastWillProperties {
     }
 
     pub fn read(bytes: &mut Bytes) -> Result<Option<LastWillProperties>, Error> {
+        Self::read_traced(bytes, &mut Vec::new())
+    }
+
+    pub(super) fn read_traced(
+        bytes: &mut Bytes,
+        order: &mut Vec<u8>,
+    ) -> Result<Option<LastWillProperties>, Error> {
         let mut delay_interval = None;
         let mut payload_format_indicator = None;
         let mut message_expiry_interval = None;
@@ -499,50 +529,48 @@ impl LastWillProperties {
         let mut correlation_data = None;
         let mut user_properties = Vec::new();
 
-        let (properties_len_len, properties_len) = length(bytes.iter())?;
-        bytes.advance(properties_len_len);
-        if properties_len == 0 {
+        let mut section = super::read_properties_section(bytes)?;
+        let bytes = &mut section;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
-        let mut cursor = 0;
-        // read until cursor reaches property length. properties_len = 0 will skip this loop
-        while cursor < properties_len {
+        let mut seen = 0u64;
+        let mut count = 0usize;
+        while bytes.has_remaining() {
             let prop = read_u8(bytes)?;
-            cursor += 1;
+            super::validate_property_occurrence(prop, prop == 38, &mut seen, &mut count)?;
+            order.push(prop);
 
             match property(prop)? {
                 PropertyType::WillDelayInterval => {
                     delay_interval = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::PayloadFormatIndicator => {
                     payload_format_indicator = Some(read_u8(bytes)?);
-                    cursor += 1;
                 }
                 PropertyType::MessageExpiryInterval => {
                     message_expiry_interval = Some(read_u32(bytes)?);
-                    cursor += 4;
                 }
                 PropertyType::ContentType => {
                     let typ = read_mqtt_string(bytes)?;
-                    cursor += 2 + typ.len();
+
                     content_type = Some(typ);
                 }
                 PropertyType::ResponseTopic => {
                     let topic = read_mqtt_string(bytes)?;
-                    cursor += 2 + topic.len();
+
                     response_topic = Some(topic);
                 }
                 PropertyType::CorrelationData => {
                     let data = read_mqtt_bytes(bytes)?;
-                    cursor += 2 + data.len();
+
                     correlation_data = Some(data);
                 }
                 PropertyType::UserProperty => {
                     let key = read_mqtt_string(bytes)?;
                     let value = read_mqtt_string(bytes)?;
-                    cursor += 2 + key.len() + 2 + value.len();
+
                     user_properties.push((key, value));
                 }
                 _ => return Err(Error::InvalidPropertyType(prop)),
