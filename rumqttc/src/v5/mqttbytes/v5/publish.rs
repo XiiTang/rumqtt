@@ -99,6 +99,13 @@ impl Publish {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         let len = self.len();
 
         let dup = self.dup as u8;
@@ -119,7 +126,7 @@ impl Publish {
         }
 
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -270,51 +277,51 @@ impl PublishProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(payload_format_indicator) = self.payload_format_indicator {
-            buffer.put_u8(PropertyType::PayloadFormatIndicator as u8);
-            buffer.put_u8(payload_format_indicator);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.payload_format_indicator.is_some())
+            + usize::from(self.message_expiry_interval.is_some())
+            + usize::from(self.topic_alias.is_some())
+            + usize::from(self.response_topic.is_some())
+            + usize::from(self.correlation_data.is_some())
+            + self.user_properties.len()
+            + self.subscription_identifiers.len()
+            + usize::from(self.content_type.is_some());
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(message_expiry_interval) = self.message_expiry_interval {
-            buffer.put_u8(PropertyType::MessageExpiryInterval as u8);
-            buffer.put_u32(message_expiry_interval);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.payload_format_indicator {
+            values.push((1, Property::Byte(*value)));
         }
-
-        if let Some(topic_alias) = self.topic_alias {
-            buffer.put_u8(PropertyType::TopicAlias as u8);
-            buffer.put_u16(topic_alias);
+        if let Some(value) = &self.message_expiry_interval {
+            values.push((2, Property::Integer(*value)));
         }
-
-        if let Some(topic) = &self.response_topic {
-            buffer.put_u8(PropertyType::ResponseTopic as u8);
-            write_mqtt_string(buffer, topic);
+        if let Some(value) = &self.topic_alias {
+            values.push((35, Property::Short(*value)));
         }
-
-        if let Some(data) = &self.correlation_data {
-            buffer.put_u8(PropertyType::CorrelationData as u8);
-            write_mqtt_bytes(buffer, data);
+        if let Some(value) = &self.response_topic {
+            values.push((8, Property::String(value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.correlation_data {
+            values.push((9, Property::Binary(value)));
         }
-
-        for id in self.subscription_identifiers.iter() {
-            buffer.put_u8(PropertyType::SubscriptionIdentifier as u8);
-            write_remaining_length(buffer, *id)?;
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
         }
-
-        if let Some(typ) = &self.content_type {
-            buffer.put_u8(PropertyType::ContentType as u8);
-            write_mqtt_string(buffer, typ);
+        for value in &self.subscription_identifiers {
+            values.push((11, Property::Variable(*value)));
         }
-
-        Ok(())
+        if let Some(value) = &self.content_type {
+            values.push((3, Property::String(value)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 

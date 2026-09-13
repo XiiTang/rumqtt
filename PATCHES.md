@@ -60,3 +60,19 @@ the state lifetime and rejects insufficient budgets before network dispatch.
 
 `FixedHeader::parse` exposes the existing MQTT 5 header validation and its length
 fields so transport framing does not duplicate packet flag and QoS rules.
+
+## MQTT 5 ordered sending
+
+`Packet::write_with_property_order` sends the existing typed packet through one
+shared property encoder. It consumes repeated values in order and rejects an
+inconsistent property inventory before exposing a partial frame. CONNECT and its
+Will have independent property order; no encoded frame is reparsed to reorder it.
+The former per-structure property writers now delegate to this same encoder.
+CONNECT preserves empty credential fields and binary passwords and correctly
+appends to nonempty output buffers. DISCONNECT uses the correct remaining length
+for both short forms and empty/nonempty property sections.
+
+Validation: 73 library tests, 7 state regressions, 8 receive-codec regressions and
+5 writer regressions passed. IMAPipe's 17 MQTT tests (including isolated Mosquitto)
+passed after its outgoing codec was replaced with this library entry point.
+MQTT 5 state integration and explicit recovery remain separate required work.

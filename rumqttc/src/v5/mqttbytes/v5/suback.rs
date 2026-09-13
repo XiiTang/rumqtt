@@ -67,6 +67,13 @@ impl SubAck {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         buffer.put_u8(0x90);
         let remaining_len = self.len();
         let remaining_len_bytes = write_remaining_length(buffer, remaining_len)?;
@@ -74,7 +81,7 @@ impl SubAck {
         buffer.put_u16(self.pkid);
 
         if let Some(p) = &self.properties {
-            p.write(buffer)?;
+            p.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }
@@ -169,21 +176,26 @@ impl SubAckProperties {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let len = self.len();
-        write_remaining_length(buffer, len)?;
-
-        if let Some(reason) = &self.reason_string {
-            buffer.put_u8(PropertyType::ReasonString as u8);
-            write_mqtt_string(buffer, reason);
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.reason_string.is_some()) + self.user_properties.len();
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.reason_string {
+            values.push((31, Property::String(value)));
         }
-
-        Ok(())
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 

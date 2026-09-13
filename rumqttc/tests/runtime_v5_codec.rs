@@ -112,7 +112,12 @@ fn auth_multibyte_property_length_and_property_count_are_bounded() {
         }),
     });
     wire.clear();
-    huge.write(&mut wire, None).unwrap();
+    assert!(huge.write(&mut wire, None).is_err());
+    // Independent malformed frame: 1025 empty user-property pairs.
+    wire = BytesMut::from(&[0xf0, 0x88, 0x28, 0x18, 0x85, 0x28][..]);
+    for _ in 0..1025 {
+        wire.extend_from_slice(&[38, 0, 0, 0, 0]);
+    }
     assert!(Packet::read(&mut wire, Some(65536)).is_err());
 }
 

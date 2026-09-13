@@ -227,32 +227,36 @@ impl DisconnectProperties {
         Ok(Some(properties))
     }
 
-    fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
-        let length = self.len();
-        write_remaining_length(buffer, length)?;
-
-        if let Some(session_expiry_interval) = self.session_expiry_interval {
-            buffer.put_u8(PropertyType::SessionExpiryInterval as u8);
-            buffer.put_u32(session_expiry_interval);
+    pub fn write(&self, buffer: &mut BytesMut) -> Result<(), Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        use super::ordered::{write_properties, Property};
+        let count = usize::from(self.session_expiry_interval.is_some())
+            + usize::from(self.reason_string.is_some())
+            + self.user_properties.len()
+            + usize::from(self.server_reference.is_some());
+        if count > 1024 {
+            return Err(Error::MalformedPacket);
         }
-
-        if let Some(reason) = &self.reason_string {
-            buffer.put_u8(PropertyType::ReasonString as u8);
-            write_mqtt_string(buffer, reason);
+        let mut values = Vec::with_capacity(count);
+        if let Some(value) = &self.session_expiry_interval {
+            values.push((17, Property::Integer(*value)));
         }
-
-        for (key, value) in self.user_properties.iter() {
-            buffer.put_u8(PropertyType::UserProperty as u8);
-            write_mqtt_string(buffer, key);
-            write_mqtt_string(buffer, value);
+        if let Some(value) = &self.reason_string {
+            values.push((31, Property::String(value)));
         }
-
-        if let Some(reference) = &self.server_reference {
-            buffer.put_u8(PropertyType::ServerReference as u8);
-            write_mqtt_string(buffer, reference);
+        for value in &self.user_properties {
+            values.push((38, Property::Pair(&value.0, &value.1)));
         }
-
-        Ok(())
+        if let Some(value) = &self.server_reference {
+            values.push((28, Property::String(value)));
+        }
+        write_properties(buffer, values, order)
     }
 }
 
@@ -268,33 +272,17 @@ impl Disconnect {
         if self.reason_code == DisconnectReasonCode::NormalDisconnection
             && self.properties.is_none()
         {
-            return 2; // Packet type + 0x00
+            return 0;
         }
-
-        let mut length = 0;
-
-        if let Some(properties) = &self.properties {
-            length += 1; // Disconnect Reason Code
-
-            let properties_len = properties.len();
-            let properties_len_len = len_len(properties_len);
-            length += properties_len_len + properties_len;
-        } else {
-            length += 1;
-        }
-
-        length
+        let properties = self
+            .properties
+            .as_ref()
+            .map_or(0, DisconnectProperties::len);
+        1 + len_len(properties) + properties
     }
-
     pub fn size(&self) -> usize {
-        let len = self.len();
-        if len == 2 {
-            return len;
-        }
-
-        let remaining_len_size = len_len(len);
-
-        1 + remaining_len_size + len
+        let length = self.len();
+        1 + len_len(length) + length
     }
 
     pub fn read(fixed_header: FixedHeader, bytes: Bytes) -> Result<Self, Error> {
@@ -341,13 +329,20 @@ impl Disconnect {
     }
 
     pub fn write(&self, buffer: &mut BytesMut) -> Result<usize, Error> {
+        self.write_ordered(buffer, None)
+    }
+    pub(super) fn write_ordered(
+        &self,
+        buffer: &mut BytesMut,
+        order: Option<&[u8]>,
+    ) -> Result<usize, Error> {
         buffer.put_u8(0xE0);
 
         let length = self.len();
 
-        if length == 2 {
+        if length == 0 {
             buffer.put_u8(0x00);
-            return Ok(length);
+            return Ok(2);
         }
 
         let len_len = write_remaining_length(buffer, length)?;
@@ -355,7 +350,7 @@ impl Disconnect {
         buffer.put_u8(self.reason_code as u8);
 
         if let Some(properties) = &self.properties {
-            properties.write(buffer)?;
+            properties.write_ordered(buffer, order)?;
         } else {
             write_remaining_length(buffer, 0)?;
         }

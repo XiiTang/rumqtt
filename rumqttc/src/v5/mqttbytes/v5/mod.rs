@@ -26,6 +26,7 @@ mod codec;
 mod connack;
 mod connect;
 mod disconnect;
+mod ordered;
 mod ping;
 mod puback;
 mod pubcomp;
@@ -203,6 +204,55 @@ impl Packet {
     }
 
     pub fn write(&self, write: &mut BytesMut, max_size: Option<u32>) -> Result<usize, Error> {
+        self.write_impl(write, max_size, None)
+    }
+    /// Encode the typed packet directly in the requested property order. Repeated
+    /// identifiers consume values in their stored order. No wire reparse is used.
+    pub fn write_with_property_order(
+        &self,
+        write: &mut BytesMut,
+        max_size: Option<u32>,
+        order: &PropertyOrder,
+    ) -> Result<usize, Error> {
+        if order.packet.len() > 1024 || order.will.len() > 1024 {
+            return Err(Error::MalformedPacket);
+        }
+        let (has_packet, has_will) = match self {
+            Self::Connect(p, w, _) => (
+                p.properties.is_some(),
+                w.as_ref().is_some_and(|w| w.properties.is_some()),
+            ),
+            Self::Auth(p) => (p.properties.is_some(), false),
+            Self::Publish(p) => (p.properties.is_some(), false),
+            Self::Subscribe(p) => (p.properties.is_some(), false),
+            Self::Unsubscribe(p) => (p.properties.is_some(), false),
+            Self::ConnAck(p) => (p.properties.is_some(), false),
+            Self::PubAck(p) => (p.properties.is_some(), false),
+            Self::SubAck(p) => (p.properties.is_some(), false),
+            Self::UnsubAck(p) => (p.properties.is_some(), false),
+            Self::PubRec(p) => (p.properties.is_some(), false),
+            Self::PubRel(p) => (p.properties.is_some(), false),
+            Self::PubComp(p) => (p.properties.is_some(), false),
+            Self::Disconnect(p) => (p.properties.is_some(), false),
+            _ => (false, false),
+        };
+        if (!has_packet && !order.packet.is_empty()) || (!has_will && !order.will.is_empty()) {
+            return Err(Error::MalformedPacket);
+        }
+        let start = write.len();
+        let result = self.write_impl(write, max_size, Some(order));
+        if result.is_err() {
+            write[start..].fill(0);
+            write.truncate(start);
+        }
+        result
+    }
+    fn write_impl(
+        &self,
+        write: &mut BytesMut,
+        max_size: Option<u32>,
+        order: Option<&PropertyOrder>,
+    ) -> Result<usize, Error> {
         if let Some(max_size) = max_size {
             if self.size() > max_size as usize {
                 return Err(Error::OutgoingPacketTooLarge {
@@ -212,22 +262,23 @@ impl Packet {
             }
         }
 
+        let packet_order = order.map(|o| o.packet.as_slice());
         match self {
-            Self::Auth(auth) => auth.write(write),
-            Self::Publish(publish) => publish.write(write),
-            Self::Subscribe(subscription) => subscription.write(write),
-            Self::Unsubscribe(unsubscribe) => unsubscribe.write(write),
-            Self::ConnAck(ack) => ack.write(write),
-            Self::PubAck(ack) => ack.write(write),
-            Self::SubAck(ack) => ack.write(write),
-            Self::UnsubAck(unsuback) => unsuback.write(write),
-            Self::PubRec(pubrec) => pubrec.write(write),
-            Self::PubRel(pubrel) => pubrel.write(write),
-            Self::PubComp(pubcomp) => pubcomp.write(write),
-            Self::Connect(connect, will, login) => connect.write(will, login, write),
+            Self::Auth(auth) => auth.write_ordered(write, packet_order),
+            Self::Publish(publish) => publish.write_ordered(write, packet_order),
+            Self::Subscribe(subscription) => subscription.write_ordered(write, packet_order),
+            Self::Unsubscribe(unsubscribe) => unsubscribe.write_ordered(write, packet_order),
+            Self::ConnAck(ack) => ack.write_ordered(write, packet_order),
+            Self::PubAck(ack) => ack.write_ordered(write, packet_order),
+            Self::SubAck(ack) => ack.write_ordered(write, packet_order),
+            Self::UnsubAck(unsuback) => unsuback.write_ordered(write, packet_order),
+            Self::PubRec(pubrec) => pubrec.write_ordered(write, packet_order),
+            Self::PubRel(pubrel) => pubrel.write_ordered(write, packet_order),
+            Self::PubComp(pubcomp) => pubcomp.write_ordered(write, packet_order),
+            Self::Connect(connect, will, login) => connect.write_ordered(will, login, write, order),
             Self::PingReq(_) => PingReq::write(write),
             Self::PingResp(_) => PingResp::write(write),
-            Self::Disconnect(disconnect) => disconnect.write(write),
+            Self::Disconnect(disconnect) => disconnect.write_ordered(write, packet_order),
         }
     }
 
