@@ -1,4 +1,8 @@
 use crate::{Event, Incoming, Outgoing, Request};
+use std::sync::{
+    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
+    Arc as RuntimeArc,
+};
 
 use crate::mqttbytes::v4::*;
 use crate::mqttbytes::{self, *};
@@ -42,6 +46,7 @@ pub enum StateError {
 // Any missing acks from the broker are detected during the next recycled use of packet ids
 #[derive(Debug, Clone)]
 pub struct MqttState {
+    transmission_flags: std::collections::BTreeMap<u16, RuntimeArc<RuntimeAtomicBool>>,
     /// Status of last ping
     pub await_pingresp: bool,
     /// Collision ping count. Collisions stop user requests
@@ -100,6 +105,7 @@ impl MqttState {
     /// instantiated for clean sessions
     pub fn new(max_inflight: u16, manual_acks: bool) -> Self {
         MqttState {
+            transmission_flags: Default::default(),
             await_pingresp: false,
             collision_ping_count: 0,
             last_incoming: Instant::now(),
@@ -125,6 +131,7 @@ impl MqttState {
 
     /// Returns inflight outgoing packets and clears internal queues
     pub fn clean(&mut self) -> Vec<Request> {
+        self.transmission_flags.clear();
         let mut pending = Vec::with_capacity(100);
         let (first_half, second_half) = self
             .outgoing_pub
@@ -157,6 +164,63 @@ impl MqttState {
         pending
     }
 
+    /// Resume the same broker session without losing QoS packet identities.
+    /// The caller must verify CONNACK Session Present before invoking this.
+    /// These are protocol retransmissions, not new application publications.
+    /// SUBSCRIBE/UNSUBSCRIBE results interrupted by the old transport are unknown;
+    /// their identifiers are returned and released without replaying operations.
+    /// Track whether a controlled writer may have transmitted a publication.
+    /// A cancelled request that never entered the writer must not be replayed.
+    pub fn track_publish_transmission(&mut self, id: u16, flag: RuntimeArc<RuntimeAtomicBool>) {
+        self.transmission_flags.insert(id, flag);
+    }
+    fn discard_unsent_publications(&mut self) {
+        let unsent: Vec<_> = self
+            .transmission_flags
+            .iter()
+            .filter_map(|(id, flag)| (!flag.load(RuntimeOrdering::Acquire)).then_some(*id))
+            .collect();
+        for id in unsent {
+            if self
+                .outgoing_pub
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .is_some()
+            {
+                self.inflight -= 1;
+            }
+            self.transmission_flags.remove(&id);
+        }
+        self.transmission_flags.retain(|id, _| {
+            self.outgoing_pub
+                .get(*id as usize)
+                .is_some_and(Option::is_some)
+        });
+    }
+    pub fn resume_session(&mut self) -> (Vec<Packet>, Vec<u16>) {
+        self.discard_unsent_publications();
+        self.await_pingresp = false;
+        self.collision_ping_count = 0;
+        self.last_incoming = Instant::now();
+        self.last_outgoing = Instant::now();
+        self.events.clear();
+        let mut interrupted: Vec<_> = self.outgoing_sub.keys().copied().collect();
+        interrupted.extend(self.outgoing_unsub.ones().map(|id| id as u16));
+        self.outgoing_sub.clear();
+        self.outgoing_unsub.clear();
+        let mut packets = Vec::new();
+        let (first, second) = self.outgoing_pub.split_at(self.last_puback as usize + 1);
+        for publish in second.iter().chain(first).flatten() {
+            let mut publish = publish.clone();
+            publish.dup = true;
+            packets.push(Packet::Publish(publish));
+        }
+        for id in self.outgoing_rel.ones() {
+            packets.push(Packet::PubRel(PubRel::new(id as u16)));
+        }
+        (packets, interrupted)
+    }
+
     pub fn inflight(&self) -> u16 {
         self.inflight
     }
@@ -176,6 +240,7 @@ impl MqttState {
     /// are counted in full. No allocator-specific tree-node layout is assumed.
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.transmission_flags.len() * 128
             + self.outgoing_pub.capacity() * std::mem::size_of::<Option<Publish>>()
             + self
                 .outgoing_pub
@@ -285,6 +350,11 @@ impl MqttState {
         if !duplicate {
             self.events.insert(event_index, Event::Incoming(packet));
         }
+        self.transmission_flags.retain(|id, _| {
+            self.outgoing_pub
+                .get(*id as usize)
+                .is_some_and(Option::is_some)
+        });
         self.last_incoming = Instant::now();
 
         Ok(outgoing)
@@ -1059,5 +1129,50 @@ mod test {
                 unreachable!()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_resume_tests {
+    use super::*;
+    #[test]
+    fn resume_preserves_publish_ids_and_incoming_qos2_deduplication() {
+        let mut state = MqttState::new(10, false);
+        let original = state
+            .handle_outgoing_packet(Request::Publish(Publish::new(
+                "out",
+                QoS::AtLeastOnce,
+                "body",
+            )))
+            .unwrap()
+            .unwrap();
+        let Packet::Publish(original) = original else {
+            panic!()
+        };
+        let mut incoming = Publish::new("in", QoS::ExactlyOnce, "body");
+        incoming.pkid = 7;
+        state
+            .handle_incoming_packet(Packet::Publish(incoming.clone()))
+            .unwrap();
+        let (packets, interrupted) = state.resume_session();
+        assert!(interrupted.is_empty());
+        let Packet::Publish(resumed) = &packets[0] else {
+            panic!()
+        };
+        assert_eq!(resumed.pkid, original.pkid);
+        assert!(resumed.dup);
+        state
+            .handle_incoming_packet(Packet::PubAck(PubAck::new(original.pkid)))
+            .unwrap();
+        assert!(!state.pending());
+        state.events.clear();
+        incoming.dup = true;
+        state
+            .handle_incoming_packet(Packet::Publish(incoming))
+            .unwrap();
+        assert!(!state
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Incoming(Packet::Publish(_)))));
     }
 }

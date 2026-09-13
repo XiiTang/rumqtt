@@ -4,6 +4,10 @@ use super::mqttbytes::v5::{
     SubscribeReasonCode, UnsubAck, Unsubscribe,
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
+use std::sync::{
+    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
+    Arc as RuntimeArc,
+};
 
 use super::{Event, Incoming, Outgoing, Request};
 
@@ -79,6 +83,7 @@ impl From<mqttbytes::Error> for StateError {
 // Any missing acks from the broker are detected during the next recycled use of packet ids
 #[derive(Debug, Clone)]
 pub struct MqttState {
+    transmission_flags: std::collections::BTreeMap<u16, RuntimeArc<RuntimeAtomicBool>>,
     /// Status of last ping
     pub await_pingresp: bool,
     /// Collision ping count. Collisions stop user requests
@@ -124,6 +129,9 @@ pub struct MqttState {
     receive_alias_maximum: u16,
     alias_bytes_maximum: usize,
     defer_write_completion: bool,
+    resume_queue: VecDeque<u16>,
+    resume_sent: FixedBitSet,
+    outgoing_expiry_started: HashMap<u16, Instant>,
 }
 
 impl MqttState {
@@ -132,6 +140,7 @@ impl MqttState {
     /// instantiated for clean sessions
     pub fn new(max_inflight: u16, manual_acks: bool) -> Self {
         MqttState {
+            transmission_flags: Default::default(),
             await_pingresp: false,
             collision_ping_count: 0,
             last_incoming: Instant::now(),
@@ -162,11 +171,15 @@ impl MqttState {
             receive_alias_maximum: 0,
             alias_bytes_maximum: 16 * 1024 * 1024,
             defer_write_completion: false,
+            resume_queue: VecDeque::new(),
+            resume_sent: FixedBitSet::with_capacity(max_inflight as usize + 1),
+            outgoing_expiry_started: HashMap::new(),
         }
     }
 
     /// Returns inflight outgoing packets and clears internal queues
     pub fn clean(&mut self) -> Vec<Request> {
+        self.transmission_flags.clear();
         let mut pending = Vec::with_capacity(100);
         // remove and collect pending publishes
         for publish in self.outgoing_pub.iter_mut() {
@@ -192,11 +205,118 @@ impl MqttState {
         self.outgoing_unsub.clear();
         self.topic_alises.clear();
         self.outgoing_aliases.clear();
+        self.resume_queue.clear();
+        self.resume_sent.clear();
+        self.outgoing_expiry_started.clear();
 
         self.await_pingresp = false;
         self.collision_ping_count = 0;
         self.inflight = 0;
         pending
+    }
+
+    /// Begin recovery of the same verified broker session. Alias and quota
+    /// negotiation is connection-local; QoS receive/replay state is not cleared.
+    /// Track whether a controlled writer may have transmitted a publication.
+    /// A cancelled request that never entered the writer must not be replayed.
+    pub fn track_publish_transmission(&mut self, id: u16, flag: RuntimeArc<RuntimeAtomicBool>) {
+        self.transmission_flags.insert(id, flag);
+    }
+    fn discard_unsent_publications(&mut self) {
+        let unsent: Vec<_> = self
+            .transmission_flags
+            .iter()
+            .filter_map(|(id, flag)| (!flag.load(RuntimeOrdering::Acquire)).then_some(*id))
+            .collect();
+        for id in unsent {
+            if self
+                .outgoing_pub
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .is_some()
+            {
+                self.inflight -= 1;
+            }
+            self.transmission_flags.remove(&id);
+        }
+        self.transmission_flags.retain(|id, _| {
+            self.outgoing_pub
+                .get(*id as usize)
+                .is_some_and(Option::is_some)
+        });
+    }
+    pub fn resume_session(&mut self) -> Vec<u16> {
+        self.discard_unsent_publications();
+        self.outgoing_expiry_started.retain(|id, _| {
+            self.outgoing_pub
+                .get(*id as usize)
+                .is_some_and(Option::is_some)
+        });
+        self.await_pingresp = false;
+        self.collision_ping_count = 0;
+        self.last_incoming = Instant::now();
+        self.last_outgoing = Instant::now();
+        self.events.clear();
+        self.topic_alises.clear();
+        self.outgoing_aliases.clear();
+        self.broker_topic_alias_max = 0;
+        self.max_outgoing_inflight = self.max_outgoing_inflight_upper_limit;
+        self.resume_sent.clear();
+        self.resume_queue.clear();
+        // PUBREL is not constrained by Receive Maximum.
+        self.resume_queue
+            .extend(self.outgoing_rel.ones().map(|id| id as u16));
+        self.resume_queue
+            .extend(self.outgoing_pub.iter().flatten().map(|p| p.pkid));
+        let interrupted = self
+            .outgoing_sub
+            .keys()
+            .chain(self.outgoing_unsub.keys())
+            .copied()
+            .collect();
+        self.outgoing_sub.clear();
+        self.outgoing_unsub.clear();
+        interrupted
+    }
+    pub fn has_resumed_packet(&self) -> bool {
+        self.resume_queue.front().is_some_and(|id| {
+            self.outgoing_rel.contains(*id as usize)
+                || self.resume_sent.count_ones(..) < self.max_outgoing_inflight as usize
+        })
+    }
+    /// Emits at most one retransmission within this connection's negotiated
+    /// Receive Maximum. Call after acknowledgements and while output has room.
+    pub fn next_resumed_packet(&mut self) -> Option<Packet> {
+        while self.has_resumed_packet() {
+            let id = self.resume_queue.pop_front()?;
+            if self.outgoing_rel.contains(id as usize) {
+                return Some(Packet::PubRel(PubRel::new(id, None)));
+            }
+            let Some(mut publish) = self.outgoing_pub[id as usize].clone() else {
+                continue;
+            };
+            if let Some(properties) = &mut publish.properties {
+                properties.topic_alias = None;
+                if let Some(expiry) = &mut properties.message_expiry_interval {
+                    let elapsed = self
+                        .outgoing_expiry_started
+                        .get(&id)
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    if elapsed >= u64::from(*expiry) {
+                        self.outgoing_pub[id as usize] = None;
+                        self.outgoing_expiry_started.remove(&id);
+                        self.inflight -= 1;
+                        continue;
+                    }
+                    *expiry -= elapsed as u32;
+                }
+            }
+            publish.dup = true;
+            self.resume_sent.insert(id as usize);
+            return Some(Packet::Publish(publish));
+        }
+        None
     }
 
     pub fn inflight(&self) -> u16 {
@@ -254,10 +374,30 @@ impl MqttState {
                 return Err(StateError::WrongPacket);
             }
         };
+        match &packet {
+            Incoming::PubAck(p) => {
+                self.resume_sent.set(p.pkid as usize, false);
+                self.outgoing_expiry_started.remove(&p.pkid);
+            }
+            Incoming::PubComp(p) => {
+                self.resume_sent.set(p.pkid as usize, false);
+                self.outgoing_expiry_started.remove(&p.pkid);
+            }
+            Incoming::PubRec(p) if u8::from(p.reason) >= 128 => {
+                self.resume_sent.set(p.pkid as usize, false);
+                self.outgoing_expiry_started.remove(&p.pkid);
+            }
+            _ => {}
+        }
 
         if !duplicate {
             self.events.insert(event_index, Event::Incoming(packet));
         }
+        self.transmission_flags.retain(|id, _| {
+            self.outgoing_pub
+                .get(*id as usize)
+                .is_some_and(Option::is_some)
+        });
         self.last_incoming = Instant::now();
         Ok(outgoing)
     }
@@ -600,7 +740,28 @@ impl MqttState {
 
             // if there is an existing publish at this pkid, this implies that broker hasn't acked this
             // packet yet. This error is possible only when broker isn't acking sequentially
-            self.outgoing_pub[pkid as usize] = Some(publish.clone());
+            let mut retained = publish.clone();
+            if retained.topic.is_empty() {
+                let alias = retained
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.topic_alias)
+                    .ok_or(StateError::InvalidState)?;
+                retained.topic = self
+                    .outgoing_aliases
+                    .get(&alias)
+                    .ok_or(StateError::InvalidState)?
+                    .clone();
+            }
+            if retained
+                .properties
+                .as_ref()
+                .and_then(|p| p.message_expiry_interval)
+                .is_some()
+            {
+                self.outgoing_expiry_started.insert(pkid, Instant::now());
+            }
+            self.outgoing_pub[pkid as usize] = Some(retained);
             self.inflight += 1;
         };
 
@@ -791,6 +952,8 @@ impl MqttState {
     pub fn initial_memory_bound(maximum: u16) -> usize {
         let slots = maximum as usize + 1;
         std::mem::size_of::<Self>()
+            + (slots + 7) / 8
+            + 64
             + slots * std::mem::size_of::<Option<Publish>>()
             + (slots + 7) / 8
             + 256
@@ -805,6 +968,10 @@ impl MqttState {
     }
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.transmission_flags.len() * 128
+            + self.resume_queue.capacity() * std::mem::size_of::<u16>()
+            + std::mem::size_of_val(self.resume_sent.as_slice())
+            + self.outgoing_expiry_started.capacity() * (64 + std::mem::size_of::<Instant>())
             + self.outgoing_pub.capacity() * std::mem::size_of::<Option<Publish>>()
             + self
                 .outgoing_pub
