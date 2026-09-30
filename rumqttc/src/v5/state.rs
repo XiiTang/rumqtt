@@ -5,8 +5,8 @@ use super::mqttbytes::v5::{
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
 use std::sync::{
-    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
     Arc as RuntimeArc,
+    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
 };
 
 use super::{Event, Incoming, Outgoing, Request};
@@ -49,9 +49,13 @@ pub enum StateError {
         "Cannot use topic alias '{alias:?}'. It's greater than the broker's maximum of '{max:?}'."
     )]
     InvalidAlias { alias: u16, max: u16 },
-    #[error("Cannot send packet of size '{pkt_size:?}'. It's greater than the broker's maximum packet size of: '{max:?}'")]
+    #[error(
+        "Cannot send packet of size '{pkt_size:?}'. It's greater than the broker's maximum packet size of: '{max:?}'"
+    )]
     OutgoingPacketTooLarge { pkt_size: u32, max: u32 },
-    #[error("Cannot receive packet of size '{pkt_size:?}'. It's greater than the client's maximum packet size of: '{max:?}'")]
+    #[error(
+        "Cannot receive packet of size '{pkt_size:?}'. It's greater than the client's maximum packet size of: '{max:?}'"
+    )]
     IncomingPacketTooLarge { pkt_size: usize, max: usize },
     #[error("Server sent disconnect with reason `{reason_string:?}` and code '{reason_code:?}' ")]
     ServerDisconnect {
@@ -100,6 +104,9 @@ pub struct MqttState {
     pub(crate) inflight: u16,
     /// Outgoing QoS 1, 2 publishes which aren't acked yet
     pub(crate) outgoing_pub: Vec<Option<Publish>>,
+    publication_order: Vec<u64>,
+    release_order: Vec<u64>,
+    next_order: u64,
     /// Packet ids of released QoS 2 publishes
     pub(crate) outgoing_rel: FixedBitSet,
     /// Packet ids on incoming QoS 2 publishes
@@ -121,6 +128,8 @@ pub struct MqttState {
     incoming_ack: FixedBitSet,
     incoming_rec: FixedBitSet,
     incoming_done: HashMap<usize, u64>,
+    completing_packets: HashMap<usize, Packet>,
+    resume_acks: VecDeque<usize>,
     next_completion: u64,
     outgoing_sub: HashMap<u16, Vec<QoS>>,
     outgoing_unsub: HashMap<u16, usize>,
@@ -149,6 +158,9 @@ impl MqttState {
             inflight: 0,
             // index 0 is wasted as 0 is not a valid packet id
             outgoing_pub: vec![None; max_inflight as usize + 1],
+            publication_order: vec![0; max_inflight as usize + 1],
+            release_order: vec![0; max_inflight as usize + 1],
+            next_order: 0,
             outgoing_rel: FixedBitSet::with_capacity(max_inflight as usize + 1),
             incoming_pub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
             collision: None,
@@ -163,6 +175,8 @@ impl MqttState {
             incoming_ack: FixedBitSet::with_capacity(65536),
             incoming_rec: FixedBitSet::with_capacity(65536),
             incoming_done: HashMap::new(),
+            completing_packets: HashMap::new(),
+            resume_acks: VecDeque::new(),
             next_completion: 0,
             outgoing_sub: HashMap::new(),
             outgoing_unsub: HashMap::new(),
@@ -201,6 +215,8 @@ impl MqttState {
         self.incoming_ack.clear();
         self.incoming_rec.clear();
         self.incoming_done.clear();
+        self.completing_packets.clear();
+        self.resume_acks.clear();
         self.outgoing_sub.clear();
         self.outgoing_unsub.clear();
         self.topic_alises.clear();
@@ -245,7 +261,24 @@ impl MqttState {
                 .is_some_and(Option::is_some)
         });
     }
-    pub fn resume_session(&mut self) -> Vec<u16> {
+    fn next_send_order(&mut self) -> Result<u64, StateError> {
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .ok_or(StateError::InvalidState)?;
+        Ok(self.next_order)
+    }
+    fn ordered_publications(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.outgoing_pub.iter().flatten().map(|p| p.pkid).collect();
+        ids.sort_by_key(|id| self.publication_order[*id as usize]);
+        ids
+    }
+    fn ordered_releases(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.outgoing_rel.ones().map(|id| id as u16).collect();
+        ids.sort_by_key(|id| self.release_order[*id as usize]);
+        ids
+    }
+    pub fn resume_session(&mut self) -> Result<Vec<u16>, StateError> {
         self.discard_unsent_publications();
         self.outgoing_expiry_started.retain(|id, _| {
             self.outgoing_pub
@@ -263,11 +296,25 @@ impl MqttState {
         self.max_outgoing_inflight = self.max_outgoing_inflight_upper_limit;
         self.resume_sent.clear();
         self.resume_queue.clear();
-        // PUBREL is not constrained by Receive Maximum.
-        self.resume_queue
-            .extend(self.outgoing_rel.ones().map(|id| id as u16));
-        self.resume_queue
-            .extend(self.outgoing_pub.iter().flatten().map(|p| p.pkid));
+        // PUBREL order follows first PUBREC receipt; PUBLISH follows first send.
+        self.resume_queue.extend(self.ordered_releases());
+        self.resume_queue.extend(self.ordered_publications());
+        self.resume_acks.clear();
+        let mut acknowledgements: Vec<_> = self
+            .completing_packets
+            .keys()
+            .map(|id| (*id, self.incoming_done.get(id).copied().unwrap_or(0)))
+            .collect();
+        acknowledgements.sort_by_key(|(_, token)| *token);
+        for (id, _) in acknowledgements {
+            if self.completing_packets.contains_key(&id) {
+                // A new transport invalidates receipts from the old write task.
+                if self.incoming_done.remove(&id).is_some() {
+                    self.mark_completing(id)?;
+                }
+                self.resume_acks.push_back(id);
+            }
+        }
         let interrupted = self
             .outgoing_sub
             .keys()
@@ -276,17 +323,21 @@ impl MqttState {
             .collect();
         self.outgoing_sub.clear();
         self.outgoing_unsub.clear();
-        interrupted
+        Ok(interrupted)
     }
     pub fn has_resumed_packet(&self) -> bool {
-        self.resume_queue.front().is_some_and(|id| {
-            self.outgoing_rel.contains(*id as usize)
-                || self.resume_sent.count_ones(..) < self.max_outgoing_inflight as usize
-        })
+        !self.resume_acks.is_empty()
+            || self.resume_queue.front().is_some_and(|id| {
+                self.outgoing_rel.contains(*id as usize)
+                    || self.resume_sent.count_ones(..) < self.max_outgoing_inflight as usize
+            })
     }
     /// Emits at most one retransmission within this connection's negotiated
     /// Receive Maximum. Call after acknowledgements and while output has room.
     pub fn next_resumed_packet(&mut self) -> Option<Packet> {
+        if let Some(id) = self.resume_acks.pop_front() {
+            return self.completing_packets.get(&id).cloned();
+        }
         while self.has_resumed_packet() {
             let id = self.resume_queue.pop_front()?;
             if self.outgoing_rel.contains(id as usize) {
@@ -303,13 +354,13 @@ impl MqttState {
                         .get(&id)
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(0);
-                    if elapsed >= u64::from(*expiry) {
+                    if elapsed >= u64::from(*expiry) && publish.qos != QoS::ExactlyOnce {
                         self.outgoing_pub[id as usize] = None;
                         self.outgoing_expiry_started.remove(&id);
                         self.inflight -= 1;
                         continue;
                     }
-                    *expiry -= elapsed as u32;
+                    *expiry = expiry.saturating_sub(elapsed.min(u64::from(u32::MAX)) as u32);
                 }
             }
             publish.dup = true;
@@ -522,6 +573,16 @@ impl MqttState {
         if !known && self.incoming_inflight() >= self.receive_maximum {
             return Err(StateError::InvalidState);
         }
+        if let Some(packet) = self.completing_packets.get(&id).filter(|_| publish.dup) {
+            let consistent = matches!(
+                (publish.qos, packet),
+                (QoS::AtLeastOnce, Packet::PubAck(_)) | (QoS::ExactlyOnce, Packet::PubRec(_))
+            );
+            if consistent {
+                return Ok(Some(packet.clone()));
+            }
+            return Err(StateError::WrongPacket);
+        }
         match publish.qos {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
@@ -584,6 +645,7 @@ impl MqttState {
         }
 
         if let Some(publish) = self.check_collision(puback.pkid) {
+            self.publication_order[publish.pkid as usize] = self.next_send_order()?;
             self.outgoing_pub[publish.pkid as usize] = Some(publish.clone());
             self.inflight += 1;
 
@@ -619,6 +681,7 @@ impl MqttState {
             self.inflight -= 1;
             return Ok(None);
         }
+        self.release_order[id] = self.next_send_order()?;
         self.outgoing_rel.insert(id);
         self.events
             .push_back(Event::Outgoing(Outgoing::PubRel(pubrec.pkid)));
@@ -633,6 +696,10 @@ impl MqttState {
         let known = self.incoming_pub.contains(id);
         if known {
             let token = self.mark_completing(id)?;
+            if self.defer_write_completion {
+                self.completing_packets
+                    .insert(id, Packet::PubComp(PubComp::new(pubrel.pkid, None)));
+            }
             if !self.defer_write_completion {
                 self.acknowledgement_written(token);
             }
@@ -761,6 +828,7 @@ impl MqttState {
             {
                 self.outgoing_expiry_started.insert(pkid, Instant::now());
             }
+            self.publication_order[pkid as usize] = self.next_send_order()?;
             self.outgoing_pub[pkid as usize] = Some(retained);
             self.inflight += 1;
         };
@@ -804,6 +872,10 @@ impl MqttState {
             return Err(StateError::Unsolicited(puback.pkid));
         }
         let token = self.mark_completing(id)?;
+        if self.defer_write_completion {
+            self.completing_packets
+                .insert(id, Packet::PubAck(puback.clone()));
+        }
         if !self.defer_write_completion {
             self.acknowledgement_written(token);
         }
@@ -818,8 +890,16 @@ impl MqttState {
             return Err(StateError::Unsolicited(pubrec.pkid));
         }
         self.incoming_rec.set(id, false);
+        if self.defer_write_completion {
+            self.completing_packets
+                .insert(id, Packet::PubRec(pubrec.clone()));
+        }
         if u8::from(pubrec.reason) >= 128 {
             let token = self.mark_completing(id)?;
+            if self.defer_write_completion {
+                self.completing_packets
+                    .insert(id, Packet::PubRec(pubrec.clone()));
+            }
             if !self.defer_write_completion {
                 self.acknowledgement_written(token);
             }
@@ -923,8 +1003,15 @@ impl MqttState {
             _ => pubrel,
         };
 
-        self.outgoing_rel.insert(pubrel.pkid as usize);
-        self.inflight += 1;
+        let id = pubrel.pkid as usize;
+        if id == 0 || id >= self.outgoing_pub.len() || self.outgoing_pub[id].is_some() {
+            return Err(StateError::InvalidState);
+        }
+        if !self.outgoing_rel.contains(id) {
+            self.release_order[id] = self.next_send_order()?;
+            self.outgoing_rel.insert(id);
+            self.inflight += 1;
+        }
         Ok(pubrel)
     }
 
@@ -954,7 +1041,7 @@ impl MqttState {
         std::mem::size_of::<Self>()
             + (slots + 7) / 8
             + 64
-            + slots * std::mem::size_of::<Option<Publish>>()
+            + slots * (std::mem::size_of::<Option<Publish>>() + 2 * std::mem::size_of::<u64>())
             + (slots + 7) / 8
             + 256
             + 3 * (8192 + 64)
@@ -968,7 +1055,16 @@ impl MqttState {
     }
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + (self.publication_order.capacity() + self.release_order.capacity())
+                * std::mem::size_of::<u64>()
             + self.transmission_flags.len() * 128
+            + self.resume_acks.capacity() * std::mem::size_of::<usize>()
+            + self.completing_packets.capacity() * (128 + std::mem::size_of::<Packet>())
+            + self
+                .completing_packets
+                .values()
+                .map(Self::acknowledgement_memory)
+                .sum::<usize>()
             + self.resume_queue.capacity() * std::mem::size_of::<u16>()
             + std::mem::size_of_val(self.resume_sent.as_slice())
             + self.outgoing_expiry_started.capacity() * (64 + std::mem::size_of::<Instant>())
@@ -1007,6 +1103,26 @@ impl MqttState {
                 .sum::<usize>()
             + self.events.capacity() * std::mem::size_of::<Event>()
     }
+    fn acknowledgement_memory(packet: &Packet) -> usize {
+        macro_rules! properties {
+            ($p:expr) => {
+                $p.properties.as_ref().map_or(0, |p| {
+                    p.reason_string.as_ref().map_or(0, String::capacity)
+                        + p.user_properties.capacity() * std::mem::size_of::<(String, String)>()
+                        + p.user_properties
+                            .iter()
+                            .map(|(k, v)| k.capacity() + v.capacity())
+                            .sum::<usize>()
+                })
+            };
+        }
+        match packet {
+            Packet::PubAck(p) => properties!(p),
+            Packet::PubRec(p) => properties!(p),
+            Packet::PubComp(p) => properties!(p),
+            _ => 0,
+        }
+    }
     /// Conservative owned heap estimate; property containers can exceed wire size.
     pub fn publication_memory_bound(p: &Publish) -> usize {
         p.topic.len()
@@ -1042,9 +1158,15 @@ impl MqttState {
                     + Self::map_insert_growth(&self.outgoing_sub)
             }
             Request::Unsubscribe(_) => Self::map_insert_growth(&self.outgoing_unsub),
-            Request::PubAck(p) => Self::map_growth(&self.incoming_done, &(p.pkid as usize)),
-            Request::PubRec(p) if u8::from(p.reason) >= 128 => {
+            Request::PubAck(p) => {
                 Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
+                    + Self::acknowledgement_memory(&Packet::PubAck(p.clone()))
+            }
+            Request::PubRec(p) => {
+                Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
+                    + Self::acknowledgement_memory(&Packet::PubRec(p.clone()))
             }
             _ => 0,
         };
@@ -1063,9 +1185,14 @@ impl MqttState {
                     .map_or(0, |id| {
                         p.topic.len() + Self::map_growth(&self.topic_alises, &id)
                     });
-                alias + Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                alias
+                    + Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
             }
-            Packet::PubRel(p) => Self::map_growth(&self.incoming_done, &(p.pkid as usize)),
+            Packet::PubRel(p) => {
+                Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
+            }
             _ => 0,
         };
         self.retained_bytes()
@@ -1162,6 +1289,7 @@ impl MqttState {
         let id = (token & 65535) as usize;
         if self.incoming_done.get(&id) == Some(&token) {
             self.incoming_done.remove(&id);
+            self.completing_packets.remove(&id);
             self.incoming_ack.set(id, false);
             self.incoming_pub.set(id, false);
             self.incoming_rec.set(id, false);
@@ -1526,5 +1654,109 @@ mod test {
 
         // should ping
         mqtt.outgoing_ping().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod recovery_correctness_tests {
+    use super::*;
+    #[test]
+    fn pending_puback_is_rebuilt_and_old_transport_receipt_cannot_complete_it() {
+        let mut state = MqttState::new(10, true);
+        state.defer_write_completion = true;
+        let mut publication = Publish::new("in", QoS::AtLeastOnce, "body", None);
+        publication.pkid = 7;
+        state.handle_incoming_publish(&mut publication).unwrap();
+        let ack = state
+            .outgoing_puback(PubAck::new(7, None))
+            .unwrap()
+            .unwrap();
+        let old = state.completion_token(&ack).unwrap();
+        state.resume_session().unwrap();
+        let ack = state.next_resumed_packet().unwrap();
+        let new = state.completion_token(&ack).unwrap();
+        assert_ne!(old, new);
+        state.acknowledgement_written(old);
+        assert_eq!(state.incoming_inflight(), 1);
+        publication.dup = true;
+        assert!(matches!(
+            state.handle_incoming_publish(&mut publication).unwrap(),
+            Some(Packet::PubAck(_))
+        ));
+        state.acknowledgement_written(new);
+        assert_eq!(state.incoming_inflight(), 0);
+    }
+    #[test]
+    fn positive_pubrec_survives_transport_replacement_until_pubcomp_is_written() {
+        let mut state = MqttState::new(10, true);
+        state.defer_write_completion = true;
+        let mut publication = Publish::new("in", QoS::ExactlyOnce, "body", None);
+        publication.pkid = 7;
+        state.handle_incoming_publish(&mut publication).unwrap();
+        state.outgoing_pubrec(PubRec::new(7, None)).unwrap();
+        state.resume_session().unwrap();
+        assert!(matches!(
+            state.next_resumed_packet(),
+            Some(Packet::PubRec(_))
+        ));
+        publication.dup = true;
+        assert!(matches!(
+            state.handle_incoming_publish(&mut publication).unwrap(),
+            Some(Packet::PubRec(_))
+        ));
+        let packet = state
+            .handle_incoming_pubrel(&PubRel::new(7, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.incoming_inflight(), 1);
+        state.acknowledgement_written(state.completion_token(&packet).unwrap());
+        assert_eq!(state.incoming_inflight(), 0);
+    }
+    #[test]
+    fn sent_qos2_does_not_expire_during_resume() {
+        let mut state = MqttState::new(10, false);
+        let properties = super::super::mqttbytes::v5::PublishProperties {
+            message_expiry_interval: Some(0),
+            ..Default::default()
+        };
+        let mut publication = Publish::new("out", QoS::ExactlyOnce, "body", Some(properties));
+        publication.pkid = 1;
+        state
+            .handle_outgoing_packet(Request::Publish(publication))
+            .unwrap();
+        state.resume_session().unwrap();
+        assert!(
+            matches!(state.next_resumed_packet(), Some(Packet::Publish(p)) if p.pkid == 1 && p.dup)
+        );
+        assert_eq!(state.inflight(), 1);
+        state.handle_incoming_pubrec(&PubRec::new(1, None)).unwrap();
+        state.resume_session().unwrap();
+        assert!(matches!(state.next_resumed_packet(), Some(Packet::PubRel(p)) if p.pkid == 1));
+    }
+    #[test]
+    fn publish_and_pubrel_recovery_use_their_own_original_order() {
+        let mut state = MqttState::new(10, false);
+        for id in [9, 1, 5] {
+            let mut publication = Publish::new("out", QoS::ExactlyOnce, "body", None);
+            publication.pkid = id;
+            state
+                .handle_outgoing_packet(Request::Publish(publication))
+                .unwrap();
+        }
+        state.resume_session().unwrap();
+        for id in [9, 1, 5] {
+            assert!(
+                matches!(state.next_resumed_packet(), Some(Packet::Publish(p)) if p.pkid == id)
+            );
+        }
+        for id in [5, 9, 1] {
+            state
+                .handle_incoming_pubrec(&PubRec::new(id, None))
+                .unwrap();
+        }
+        state.resume_session().unwrap();
+        for id in [5, 9, 1] {
+            assert!(matches!(state.next_resumed_packet(), Some(Packet::PubRel(p)) if p.pkid == id));
+        }
     }
 }

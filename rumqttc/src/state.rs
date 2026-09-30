@@ -1,7 +1,7 @@
 use crate::{Event, Incoming, Outgoing, Request};
 use std::sync::{
-    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
     Arc as RuntimeArc,
+    atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
 };
 
 use crate::mqttbytes::v4::*;
@@ -67,6 +67,9 @@ pub struct MqttState {
     pub(crate) max_inflight: u16,
     /// Outgoing QoS 1, 2 publishes which aren't acked yet
     pub(crate) outgoing_pub: Vec<Option<Publish>>,
+    publication_order: Vec<u64>,
+    release_order: Vec<u64>,
+    next_order: u64,
     /// Packet ids of released QoS 2 publishes
     pub(crate) outgoing_rel: FixedBitSet,
     /// Packet ids on incoming QoS 2 publishes
@@ -94,7 +97,7 @@ impl MqttState {
     pub fn initial_memory_bound(max_inflight: u16) -> usize {
         let slots = usize::from(max_inflight) + 1;
         std::mem::size_of::<Self>()
-            + slots * std::mem::size_of::<Option<Publish>>()
+            + slots * (std::mem::size_of::<Option<Publish>>() + 2 * std::mem::size_of::<u64>())
             + 3 * (65536 / 8 + 64)
             + 2 * (slots.div_ceil(8) + 64)
             + 100 * std::mem::size_of::<Event>()
@@ -116,6 +119,9 @@ impl MqttState {
             max_inflight,
             // index 0 is wasted as 0 is not a valid packet id
             outgoing_pub: vec![None; max_inflight as usize + 1],
+            publication_order: vec![0; max_inflight as usize + 1],
+            release_order: vec![0; max_inflight as usize + 1],
+            next_order: 0,
             outgoing_rel: FixedBitSet::with_capacity(max_inflight as usize + 1),
             incoming_pub: FixedBitSet::with_capacity(u16::MAX as usize + 1),
             incoming_ack: FixedBitSet::with_capacity(u16::MAX as usize + 1),
@@ -197,6 +203,23 @@ impl MqttState {
                 .is_some_and(Option::is_some)
         });
     }
+    fn next_send_order(&mut self) -> Result<u64, StateError> {
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .ok_or(StateError::InvalidState)?;
+        Ok(self.next_order)
+    }
+    fn ordered_publications(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.outgoing_pub.iter().flatten().map(|p| p.pkid).collect();
+        ids.sort_by_key(|id| self.publication_order[*id as usize]);
+        ids
+    }
+    fn ordered_releases(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.outgoing_rel.ones().map(|id| id as u16).collect();
+        ids.sort_by_key(|id| self.release_order[*id as usize]);
+        ids
+    }
     pub fn resume_session(&mut self) -> (Vec<Packet>, Vec<u16>) {
         self.discard_unsent_publications();
         self.await_pingresp = false;
@@ -209,14 +232,13 @@ impl MqttState {
         self.outgoing_sub.clear();
         self.outgoing_unsub.clear();
         let mut packets = Vec::new();
-        let (first, second) = self.outgoing_pub.split_at(self.last_puback as usize + 1);
-        for publish in second.iter().chain(first).flatten() {
-            let mut publish = publish.clone();
+        for id in self.ordered_publications() {
+            let mut publish = self.outgoing_pub[id as usize].as_ref().unwrap().clone();
             publish.dup = true;
             packets.push(Packet::Publish(publish));
         }
-        for id in self.outgoing_rel.ones() {
-            packets.push(Packet::PubRel(PubRel::new(id as u16)));
+        for id in self.ordered_releases() {
+            packets.push(Packet::PubRel(PubRel::new(id)));
         }
         (packets, interrupted)
     }
@@ -240,6 +262,8 @@ impl MqttState {
     /// are counted in full. No allocator-specific tree-node layout is assumed.
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + (self.publication_order.capacity() + self.release_order.capacity())
+                * std::mem::size_of::<u64>()
             + self.transmission_flags.len() * 128
             + self.outgoing_pub.capacity() * std::mem::size_of::<Option<Publish>>()
             + self
@@ -440,16 +464,20 @@ impl MqttState {
         }
 
         self.inflight -= 1;
-        let packet = self.check_collision(puback.pkid).map(|publish| {
-            self.outgoing_pub[publish.pkid as usize] = Some(publish.clone());
-            self.inflight += 1;
+        let packet = self
+            .check_collision(puback.pkid)
+            .map(|publish| -> Result<Packet, StateError> {
+                self.publication_order[publish.pkid as usize] = self.next_send_order()?;
+                self.outgoing_pub[publish.pkid as usize] = Some(publish.clone());
+                self.inflight += 1;
 
-            let event = Event::Outgoing(Outgoing::Publish(publish.pkid));
-            self.events.push_back(event);
-            self.collision_ping_count = 0;
+                let event = Event::Outgoing(Outgoing::Publish(publish.pkid));
+                self.events.push_back(event);
+                self.collision_ping_count = 0;
 
-            Packet::Publish(publish)
-        });
+                Ok(Packet::Publish(publish))
+            })
+            .transpose()?;
 
         Ok(packet)
     }
@@ -474,6 +502,7 @@ impl MqttState {
         }
 
         // NOTE: Inflight - 1 for qos2 in comp
+        self.release_order[pubrec.pkid as usize] = self.next_send_order()?;
         self.outgoing_rel.insert(pubrec.pkid as usize);
         let pubrel = PubRel { pkid: pubrec.pkid };
         let event = Event::Outgoing(Outgoing::PubRel(pubrec.pkid));
@@ -506,13 +535,19 @@ impl MqttState {
 
         self.outgoing_rel.set(pubcomp.pkid as usize, false);
         self.inflight -= 1;
-        let packet = self.check_collision(pubcomp.pkid).map(|publish| {
-            let event = Event::Outgoing(Outgoing::Publish(publish.pkid));
-            self.events.push_back(event);
-            self.collision_ping_count = 0;
+        let packet = self
+            .check_collision(pubcomp.pkid)
+            .map(|publish| -> Result<Packet, StateError> {
+                self.publication_order[publish.pkid as usize] = self.next_send_order()?;
+                self.outgoing_pub[publish.pkid as usize] = Some(publish.clone());
+                self.inflight += 1;
+                let event = Event::Outgoing(Outgoing::Publish(publish.pkid));
+                self.events.push_back(event);
+                self.collision_ping_count = 0;
 
-            Packet::Publish(publish)
-        });
+                Ok(Packet::Publish(publish))
+            })
+            .transpose()?;
 
         Ok(packet)
     }
@@ -556,6 +591,7 @@ impl MqttState {
 
             // if there is an existing publish at this pkid, this implies that broker hasn't acked this
             // packet yet. This error is possible only when broker isn't acking sequentially
+            self.publication_order[pkid as usize] = self.next_send_order()?;
             self.outgoing_pub[pkid as usize] = Some(publish.clone());
             self.inflight += 1;
         };
@@ -724,6 +760,7 @@ impl MqttState {
             return Err(StateError::InvalidState);
         }
         if !self.outgoing_rel.contains(id) {
+            self.release_order[id] = self.next_send_order()?;
             self.outgoing_rel.insert(id);
             self.inflight += 1;
         }
@@ -1170,9 +1207,52 @@ mod runtime_resume_tests {
         state
             .handle_incoming_packet(Packet::Publish(incoming))
             .unwrap();
-        assert!(!state
-            .events
-            .iter()
-            .any(|e| matches!(e, Event::Incoming(Packet::Publish(_)))));
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Incoming(Packet::Publish(_))))
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovery_order_tests {
+    use super::*;
+    #[test]
+    fn identifier_wrap_does_not_reorder_publications_or_releases() {
+        let mut state = MqttState::new(10, false);
+        for id in [9, 1, 5] {
+            let mut publication = Publish::new("out", QoS::ExactlyOnce, "body");
+            publication.pkid = id;
+            state
+                .handle_outgoing_packet(Request::Publish(publication))
+                .unwrap();
+        }
+        let (packets, _) = state.resume_session();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|p| match p {
+                    Packet::Publish(p) => p.pkid,
+                    _ => panic!(),
+                })
+                .collect::<Vec<_>>(),
+            vec![9, 1, 5]
+        );
+        for id in [5, 9, 1] {
+            state.handle_incoming_pubrec(&PubRec::new(id)).unwrap();
+        }
+        let (packets, _) = state.resume_session();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|p| match p {
+                    Packet::PubRel(p) => p.pkid,
+                    _ => panic!(),
+                })
+                .collect::<Vec<_>>(),
+            vec![5, 9, 1]
+        );
     }
 }
