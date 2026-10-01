@@ -128,6 +128,7 @@ pub struct MqttState {
     incoming_ack: FixedBitSet,
     incoming_rec: FixedBitSet,
     incoming_done: HashMap<usize, u64>,
+    incoming_write: HashMap<usize, u64>,
     completing_packets: HashMap<usize, Packet>,
     resume_acks: VecDeque<usize>,
     next_completion: u64,
@@ -175,6 +176,7 @@ impl MqttState {
             incoming_ack: FixedBitSet::with_capacity(65536),
             incoming_rec: FixedBitSet::with_capacity(65536),
             incoming_done: HashMap::new(),
+            incoming_write: HashMap::new(),
             completing_packets: HashMap::new(),
             resume_acks: VecDeque::new(),
             next_completion: 0,
@@ -215,6 +217,7 @@ impl MqttState {
         self.incoming_ack.clear();
         self.incoming_rec.clear();
         self.incoming_done.clear();
+        self.incoming_write.clear();
         self.completing_packets.clear();
         self.resume_acks.clear();
         self.outgoing_sub.clear();
@@ -303,14 +306,17 @@ impl MqttState {
         let mut acknowledgements: Vec<_> = self
             .completing_packets
             .keys()
-            .map(|id| (*id, self.incoming_done.get(id).copied().unwrap_or(0)))
+            .map(|id| (*id, self.incoming_write.get(id).copied().unwrap_or(0)))
             .collect();
         acknowledgements.sort_by_key(|(_, token)| *token);
         for (id, _) in acknowledgements {
             if self.completing_packets.contains_key(&id) {
                 // A new transport invalidates receipts from the old write task.
-                if self.incoming_done.remove(&id).is_some() {
-                    self.mark_completing(id)?;
+                let terminal = self.incoming_done.remove(&id).is_some();
+                self.incoming_write.remove(&id);
+                let token = self.mark_acknowledgement(id)?;
+                if terminal {
+                    self.incoming_done.insert(id, token);
                 }
                 self.resume_acks.push_back(id);
             }
@@ -891,6 +897,7 @@ impl MqttState {
         }
         self.incoming_rec.set(id, false);
         if self.defer_write_completion {
+            self.mark_acknowledgement(id)?;
             self.completing_packets
                 .insert(id, Packet::PubRec(pubrec.clone()));
         }
@@ -1091,6 +1098,7 @@ impl MqttState {
                 .sum::<usize>()
             + (self.outgoing_sub.capacity()
                 + self.outgoing_unsub.capacity()
+                + self.incoming_write.capacity()
                 + self.incoming_done.capacity()
                 + self.topic_alises.capacity()
                 + self.outgoing_aliases.capacity())
@@ -1160,11 +1168,13 @@ impl MqttState {
             Request::Unsubscribe(_) => Self::map_insert_growth(&self.outgoing_unsub),
             Request::PubAck(p) => {
                 Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.incoming_write, &(p.pkid as usize))
                     + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
                     + Self::acknowledgement_memory(&Packet::PubAck(p.clone()))
             }
             Request::PubRec(p) => {
                 Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.incoming_write, &(p.pkid as usize))
                     + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
                     + Self::acknowledgement_memory(&Packet::PubRec(p.clone()))
             }
@@ -1187,10 +1197,12 @@ impl MqttState {
                     });
                 alias
                     + Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.incoming_write, &(p.pkid as usize))
                     + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
             }
             Packet::PubRel(p) => {
                 Self::map_growth(&self.incoming_done, &(p.pkid as usize))
+                    + Self::map_growth(&self.incoming_write, &(p.pkid as usize))
                     + Self::map_growth(&self.completing_packets, &(p.pkid as usize))
             }
             _ => 0,
@@ -1263,8 +1275,8 @@ impl MqttState {
             Err(StateError::Unsolicited(id as u16))
         }
     }
-    fn mark_completing(&mut self, id: usize) -> Result<u64, StateError> {
-        if let Some(token) = self.incoming_done.get(&id) {
+    fn mark_acknowledgement(&mut self, id: usize) -> Result<u64, StateError> {
+        if let Some(token) = self.incoming_write.get(&id) {
             return Ok(*token);
         }
         self.next_completion = self
@@ -1272,6 +1284,15 @@ impl MqttState {
             .checked_add(65536)
             .ok_or(StateError::InvalidState)?;
         let token = self.next_completion | id as u64;
+        self.incoming_write.insert(id, token);
+        Ok(token)
+    }
+    fn mark_completing(&mut self, id: usize) -> Result<u64, StateError> {
+        if !self.incoming_done.contains_key(&id) {
+            // PUBCOMP owns a new physical write; a late PUBREC write cannot settle it.
+            self.incoming_write.remove(&id);
+        }
+        let token = self.mark_acknowledgement(id)?;
         self.incoming_done.insert(id, token);
         Ok(token)
     }
@@ -1283,16 +1304,19 @@ impl MqttState {
             Packet::PubComp(p) => p.pkid,
             _ => return None,
         };
-        self.incoming_done.get(&(id as usize)).copied()
+        self.incoming_write.get(&(id as usize)).copied()
     }
     pub fn acknowledgement_written(&mut self, token: u64) {
         let id = (token & 65535) as usize;
-        if self.incoming_done.get(&id) == Some(&token) {
-            self.incoming_done.remove(&id);
+        if self.incoming_write.get(&id) == Some(&token) {
+            self.incoming_write.remove(&id);
             self.completing_packets.remove(&id);
-            self.incoming_ack.set(id, false);
-            self.incoming_pub.set(id, false);
-            self.incoming_rec.set(id, false);
+            if self.incoming_done.get(&id) == Some(&token) {
+                self.incoming_done.remove(&id);
+                self.incoming_ack.set(id, false);
+                self.incoming_pub.set(id, false);
+                self.incoming_rec.set(id, false);
+            }
         }
     }
     fn insert_alias(
