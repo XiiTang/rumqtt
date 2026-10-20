@@ -98,3 +98,23 @@ regressions, 5 MQTT 5 writer regressions and 7 MQTT 5 state/admission regression
 passed. All 17 Runtime MQTT tests passed, including isolated Mosquitto for both
 versions, manual acknowledgement, negative QoS 2, frozen authentication,
 reauthentication privacy, cancellation and resource release.
+
+## MQTT 5 incoming topic aliases
+
+Upstream `handle_incoming_packet` hands the packet out as `Event::Incoming`
+before `handle_incoming_publish` resolves its Topic Alias, so every PUBLISH
+naming its topic only by an alias reaches the caller with an empty topic, and
+an alias the connection never set calls `handle_protocol_error()?`, whose
+`Ok(Some(DISCONNECT))` the `?` discards. The externally driven state above
+emits the event after resolving it, but emits none for a QoS 2 duplicate,
+which then loses its resolved topic with the packet.
+
+`handle_incoming` handles the caller's own packet, resolving the alias in it
+for new publications and duplicates alike; `handle_incoming_packet` keeps
+its signature over it, cloning the packet for the event. A PUBLISH with an
+empty topic and an alias never set fails with `StateError::UnknownAlias`;
+every other `InvalidState` is unchanged.
+
+Validation: `a_duplicate_keeps_its_resolved_alias_and_an_unset_alias_is_named`
+in `tests/runtime_v5_state.rs`, with the library tests and the state
+regressions; Boundless's MQTT 5 duplicate-alias and unknown-alias tests.

@@ -49,6 +49,10 @@ pub enum StateError {
         "Cannot use topic alias '{alias:?}'. It's greater than the broker's maximum of '{max:?}'."
     )]
     InvalidAlias { alias: u16, max: u16 },
+    /// An incoming PUBLISH named its topic only by an alias this connection
+    /// never set.
+    #[error("Received topic alias '{0}', which this connection never set")]
+    UnknownAlias(u16),
     #[error(
         "Cannot send packet of size '{pkt_size:?}'. It's greater than the broker's maximum packet size of: '{max:?}'"
     )]
@@ -412,10 +416,17 @@ impl MqttState {
         &mut self,
         mut packet: Incoming,
     ) -> Result<Option<Packet>, StateError> {
+        self.handle_incoming(&mut packet)
+    }
+
+    /// [`Self::handle_incoming_packet`] on the caller's packet, which keeps
+    /// what handling resolved in it: an incoming PUBLISH's topic named by an
+    /// alias, a duplicate's as well.
+    pub fn handle_incoming(&mut self, packet: &mut Incoming) -> Result<Option<Packet>, StateError> {
         let duplicate = matches!(&packet, Incoming::Publish(p) if p.qos == QoS::ExactlyOnce && self.incoming_pub.contains(p.pkid as usize));
         let event_index = self.events.len();
 
-        let outgoing = match &mut packet {
+        let outgoing = match &mut *packet {
             Incoming::PingResp(_) => self.handle_incoming_pingresp()?,
             Incoming::Publish(publish) => self.handle_incoming_publish(publish)?,
             Incoming::SubAck(suback) => self.handle_incoming_suback(suback)?,
@@ -448,7 +459,7 @@ impl MqttState {
         }
 
         if !duplicate {
-            self.events.insert(event_index, Event::Incoming(packet));
+            self.events.insert(event_index, Event::Incoming(packet.clone()));
         }
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
@@ -556,7 +567,7 @@ impl MqttState {
                     .topic_alises
                     .get(&alias)
                     .cloned()
-                    .ok_or(StateError::InvalidState)?;
+                    .ok_or(StateError::UnknownAlias(alias))?;
             } else {
                 Self::insert_alias(
                     &mut self.topic_alises,

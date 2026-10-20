@@ -1,6 +1,6 @@
 use rumqttc::v5::{
     mqttbytes::{v5::*, QoS},
-    Event, MqttState, Request,
+    Event, MqttState, Request, StateError,
 };
 
 fn publish(qos: QoS, id: u16, dup: bool) -> Publish {
@@ -213,6 +213,36 @@ fn aliases_are_resolved_and_rejected_before_outgoing_admission() {
     assert!(s.handle_outgoing_packet(Request::Publish(p)).is_err());
     assert!(!s.pending());
     assert_eq!(s.next_available_packet_id().unwrap(), 1);
+}
+
+#[test]
+fn a_duplicate_keeps_its_resolved_alias_and_an_unset_alias_is_named() {
+    let mut s = state(false);
+    let mut p = publish(QoS::ExactlyOnce, 7, false);
+    p.properties = Some(PublishProperties {
+        topic_alias: Some(2),
+        ..Default::default()
+    });
+    s.handle_incoming_packet(Packet::Publish(p.clone()))
+        .unwrap();
+    s.events.clear();
+    // The Broker sends the publication again, naming its topic by the alias.
+    p.topic = bytes::Bytes::new();
+    p.dup = true;
+    let mut duplicate = Packet::Publish(p);
+    s.handle_incoming(&mut duplicate).unwrap();
+    assert!(!s.events.iter().any(|e| matches!(e, Event::Incoming(_))));
+    assert!(matches!(duplicate, Packet::Publish(p) if p.topic.as_ref() == b"fixture"));
+    let mut unset = publish(QoS::AtMostOnce, 0, false);
+    unset.topic = bytes::Bytes::new();
+    unset.properties = Some(PublishProperties {
+        topic_alias: Some(3),
+        ..Default::default()
+    });
+    assert!(matches!(
+        s.handle_incoming_packet(Packet::Publish(unset)),
+        Err(StateError::UnknownAlias(3))
+    ));
 }
 
 #[test]
