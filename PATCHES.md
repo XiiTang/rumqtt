@@ -98,3 +98,13 @@ regressions, 5 MQTT 5 writer regressions and 7 MQTT 5 state/admission regression
 passed. All 17 Runtime MQTT tests passed, including isolated Mosquitto for both
 versions, manual acknowledgement, negative QoS 2, frozen authentication,
 reauthentication privacy, cancellation and resource release.
+
+## Fixed certificate verification in the 0.103 TLS graph (#312)
+
+Update the workspace lockfile's rustls-webpki 0.103.8 to 0.103.16 for
+RUSTSEC-2026-0382. webpki requires aws-lc-rs 1.18; keep its minimum
+1.18.0 and aws-lc-sys 0.44.0, removing the old native generator dependencies
+that are no longer required. Retain other locked versions. No MQTT state,
+codec, recovery or transport implementation changes. Regression coverage:
+the rumqttc library and the runtime_state, runtime_v5_state, runtime_v5_codec
+and runtime_v5_writer integration suites, plus Boundless's full MQTT module.
