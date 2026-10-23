@@ -53,8 +53,8 @@ impl Network {
         let mut count = 1;
         loop {
             match res {
-                Some(Ok(packet)) => {
-                    if let Some(outgoing) = state.handle_incoming_packet(packet)? {
+                Some(Ok(mut packet)) => {
+                    if let Some(outgoing) = state.handle_incoming_packet(&mut packet)? {
                         self.write(outgoing).await?;
                     }
 

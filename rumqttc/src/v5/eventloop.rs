@@ -160,7 +160,7 @@ impl EventLoop {
             }
 
             self.state
-                .handle_incoming_packet(Incoming::ConnAck(connack))?;
+                .handle_incoming_packet(&mut Incoming::ConnAck(connack))?;
         }
 
         match self.select().await {

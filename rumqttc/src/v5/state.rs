@@ -404,18 +404,17 @@ impl MqttState {
         Ok(packet)
     }
 
-    /// Consolidates handling of all incoming mqtt packets. Returns a `Notification` which for the
-    /// user to consume and `Packet` which for the eventloop to put on the network
-    /// E.g For incoming QoS1 publish packet, this method returns (Publish, Puback). Publish packet will
-    /// be forwarded to user and Pubck packet will be written to network
+    /// Process one incoming packet through the session state. Resolves a PUBLISH
+    /// topic in the caller's packet, including QoS 2 duplicates that emit no
+    /// Incoming event. Returns any protocol acknowledgement to write.
     pub fn handle_incoming_packet(
         &mut self,
-        mut packet: Incoming,
+        packet: &mut Incoming,
     ) -> Result<Option<Packet>, StateError> {
-        let duplicate = matches!(&packet, Incoming::Publish(p) if p.qos == QoS::ExactlyOnce && self.incoming_pub.contains(p.pkid as usize));
+        let duplicate = matches!(&*packet, Incoming::Publish(p) if p.qos == QoS::ExactlyOnce && self.incoming_pub.contains(p.pkid as usize));
         let event_index = self.events.len();
 
-        let outgoing = match &mut packet {
+        let outgoing = match &mut *packet {
             Incoming::PingResp(_) => self.handle_incoming_pingresp()?,
             Incoming::Publish(publish) => self.handle_incoming_publish(publish)?,
             Incoming::SubAck(suback) => self.handle_incoming_suback(suback)?,
@@ -431,7 +430,7 @@ impl MqttState {
                 return Err(StateError::WrongPacket);
             }
         };
-        match &packet {
+        match &*packet {
             Incoming::PubAck(p) => {
                 self.resume_sent.set(p.pkid as usize, false);
                 self.outgoing_expiry_started.remove(&p.pkid);
@@ -448,7 +447,7 @@ impl MqttState {
         }
 
         if !duplicate {
-            self.events.insert(event_index, Event::Incoming(packet));
+            self.events.insert(event_index, Event::Incoming(packet.clone()));
         }
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
@@ -1656,7 +1655,7 @@ mod test {
         let publish = build_outgoing_publish(QoS::AtLeastOnce);
         mqtt.handle_outgoing_packet(Request::Publish(publish))
             .unwrap();
-        mqtt.handle_incoming_packet(Incoming::PubAck(PubAck::new(1, None)))
+        mqtt.handle_incoming_packet(&mut Incoming::PubAck(PubAck::new(1, None)))
             .unwrap();
 
         // should throw error because we didn't get pingresp for previous ping
@@ -1673,7 +1672,7 @@ mod test {
 
         // should ping
         mqtt.outgoing_ping().unwrap();
-        mqtt.handle_incoming_packet(Incoming::PingResp(PingResp))
+        mqtt.handle_incoming_packet(&mut Incoming::PingResp(PingResp))
             .unwrap();
 
         // should ping

@@ -108,3 +108,20 @@ that are no longer required. Retain other locked versions. No MQTT state,
 codec, recovery or transport implementation changes. Regression coverage:
 the rumqttc library and the runtime_state, runtime_v5_state, runtime_v5_codec
 and runtime_v5_writer integration suites, plus Boundless's full MQTT module.
+
+## Resolved incoming MQTT 5 topics (#167)
+
+`MqttState::handle_incoming_packet` takes the caller's packet by mutable
+reference. Its existing private PUBLISH handler resolves the connection's
+Topic Alias before QoS handling; that resolved topic now stays in the caller's
+packet even when a QoS 2 duplicate emits no `Event::Incoming`. The EventLoop,
+framed reader and state tests use this same entry point. The alias table stays
+private; no second resolver or owned-packet compatibility entry point is added.
+
+Reason: Boundless previously obtained a resolved topic only from an Incoming
+event, so an alias-only QoS 2 duplicate reached its program with an empty topic.
+Regression: `runtime_v5_alias::incoming_packets_keep_the_resolved_topic_before_duplicate_suppression`
+checks automatic and manual acknowledgement, alias-only duplicates and alias
+reassignment on a duplicate. Boundless's independent-byte peer test
+`issue_167_a_duplicate_named_by_its_alias_carries_the_topic` checks the actual
+program-visible topic and the peer's PUBREC in both acknowledgement modes.

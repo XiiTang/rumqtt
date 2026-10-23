@@ -21,13 +21,13 @@ fn wrong_qos_and_negative_outcomes_do_not_lose_or_replay_publications() {
     s.handle_outgoing_packet(Request::Publish(publish(QoS::ExactlyOnce, 0, false)))
         .unwrap();
     assert!(s
-        .handle_incoming_packet(Packet::PubAck(PubAck::new(1, None)))
+        .handle_incoming_packet(&mut Packet::PubAck(PubAck::new(1, None)))
         .is_err());
     assert_eq!(s.inflight(), 1);
     let mut rec = PubRec::new(1, None);
     rec.reason = 128u8.try_into().unwrap();
     assert!(s
-        .handle_incoming_packet(Packet::PubRec(rec))
+        .handle_incoming_packet(&mut Packet::PubRec(rec))
         .unwrap()
         .is_none());
     assert!(!s.pending());
@@ -35,13 +35,13 @@ fn wrong_qos_and_negative_outcomes_do_not_lose_or_replay_publications() {
         .unwrap();
     for _ in 0..2 {
         assert!(
-            matches!(s.handle_incoming_packet(Packet::PubRec(PubRec::new(2, None))).unwrap(), Some(Packet::PubRel(p)) if p.pkid == 2)
+            matches!(s.handle_incoming_packet(&mut Packet::PubRec(PubRec::new(2, None))).unwrap(), Some(Packet::PubRel(p)) if p.pkid == 2)
         );
     }
     let mut comp = PubComp::new(2, None);
     comp.reason = PubCompReason::PacketIdentifierNotFound;
     assert!(s
-        .handle_incoming_packet(Packet::PubComp(comp))
+        .handle_incoming_packet(&mut Packet::PubComp(comp))
         .unwrap()
         .is_none());
     assert!(!s.pending());
@@ -50,16 +50,16 @@ fn wrong_qos_and_negative_outcomes_do_not_lose_or_replay_publications() {
 #[test]
 fn manual_qos2_duplicates_and_physical_completion_preserve_receive_credit() {
     let mut s = state(true);
-    s.handle_incoming_packet(Packet::Publish(publish(QoS::ExactlyOnce, 42, false)))
+    s.handle_incoming_packet(&mut Packet::Publish(publish(QoS::ExactlyOnce, 42, false)))
         .unwrap();
     s.events.clear();
     assert!(s
-        .handle_incoming_packet(Packet::Publish(publish(QoS::ExactlyOnce, 42, true)))
+        .handle_incoming_packet(&mut Packet::Publish(publish(QoS::ExactlyOnce, 42, true)))
         .unwrap()
         .is_none());
     assert!(s.events.is_empty());
     assert!(s
-        .handle_incoming_packet(Packet::PubRel(PubRel::new(42, None)))
+        .handle_incoming_packet(&mut Packet::PubRel(PubRel::new(42, None)))
         .is_err());
     assert_eq!(s.acknowledgement_kind(42).unwrap(), 5);
     s.handle_outgoing_packet(Request::PubRec(PubRec::new(42, None)))
@@ -67,33 +67,33 @@ fn manual_qos2_duplicates_and_physical_completion_preserve_receive_credit() {
     assert!(s.acknowledgement_kind(42).is_err());
     s.events.clear();
     assert!(matches!(
-        s.handle_incoming_packet(Packet::Publish(publish(QoS::ExactlyOnce, 42, true)))
+        s.handle_incoming_packet(&mut Packet::Publish(publish(QoS::ExactlyOnce, 42, true)))
             .unwrap(),
         Some(Packet::PubRec(_))
     ));
     assert!(!s.events.iter().any(|e| matches!(e, Event::Incoming(_))));
     let reply = s
-        .handle_incoming_packet(Packet::PubRel(PubRel::new(42, None)))
+        .handle_incoming_packet(&mut Packet::PubRel(PubRel::new(42, None)))
         .unwrap()
         .unwrap();
     let token = s.completion_token(&reply).unwrap();
     let duplicate = s
-        .handle_incoming_packet(Packet::PubRel(PubRel::new(42, None)))
+        .handle_incoming_packet(&mut Packet::PubRel(PubRel::new(42, None)))
         .unwrap()
         .unwrap();
     assert_eq!(s.completion_token(&duplicate), Some(token));
     assert_eq!(s.incoming_inflight(), 1);
     assert!(s
-        .handle_incoming_packet(Packet::Publish(publish(QoS::AtLeastOnce, 43, false)))
+        .handle_incoming_packet(&mut Packet::Publish(publish(QoS::AtLeastOnce, 43, false)))
         .is_err());
     s.acknowledgement_written(token);
     assert_eq!(s.incoming_inflight(), 0);
-    s.handle_incoming_packet(Packet::Publish(publish(QoS::ExactlyOnce, 42, false)))
+    s.handle_incoming_packet(&mut Packet::Publish(publish(QoS::ExactlyOnce, 42, false)))
         .unwrap();
     s.handle_outgoing_packet(Request::PubRec(PubRec::new(42, None)))
         .unwrap();
     let reply = s
-        .handle_incoming_packet(Packet::PubRel(PubRel::new(42, None)))
+        .handle_incoming_packet(&mut Packet::PubRel(PubRel::new(42, None)))
         .unwrap()
         .unwrap();
     let next = s.completion_token(&reply).unwrap();
@@ -108,7 +108,7 @@ fn manual_qos2_duplicates_and_physical_completion_preserve_receive_credit() {
 fn manual_negative_pubrec_and_qos1_ack_finish_only_after_write() {
     for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
         let mut s = state(true);
-        s.handle_incoming_packet(Packet::Publish(publish(qos, 1, false)))
+        s.handle_incoming_packet(&mut Packet::Publish(publish(qos, 1, false)))
             .unwrap();
         let request = if qos == QoS::AtLeastOnce {
             Request::PubAck(PubAck::new(1, None))
@@ -130,7 +130,7 @@ fn request_types_share_identifiers_and_suback_validates_before_releasing() {
     let mut s = MqttState::new(3, false);
     s.handle_outgoing_packet(Request::Publish(publish(QoS::ExactlyOnce, 0, false)))
         .unwrap();
-    s.handle_incoming_packet(Packet::PubRec(PubRec::new(1, None)))
+    s.handle_incoming_packet(&mut Packet::PubRec(PubRec::new(1, None)))
         .unwrap();
     let sub = Subscribe::new(Filter::new("fixture", QoS::AtMostOnce), None);
     assert!(
@@ -145,14 +145,14 @@ fn request_types_share_identifiers_and_suback_validates_before_releasing() {
         .is_err());
     for codes in [vec![], vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)]] {
         assert!(s
-            .handle_incoming_packet(Packet::SubAck(SubAck {
+            .handle_incoming_packet(&mut Packet::SubAck(SubAck {
                 pkid: 2,
                 return_codes: codes,
                 properties: None
             }))
             .is_err());
     }
-    s.handle_incoming_packet(Packet::SubAck(SubAck {
+    s.handle_incoming_packet(&mut Packet::SubAck(SubAck {
         pkid: 2,
         return_codes: vec![128u8.try_into().unwrap()],
         properties: None,
@@ -160,19 +160,19 @@ fn request_types_share_identifiers_and_suback_validates_before_releasing() {
     .unwrap();
     assert_eq!(s.next_available_packet_id().unwrap(), 2);
     assert!(s
-        .handle_incoming_packet(Packet::UnsubAck(UnsubAck {
+        .handle_incoming_packet(&mut Packet::UnsubAck(UnsubAck {
             pkid: 3,
             reasons: vec![],
             properties: None
         }))
         .is_err());
-    s.handle_incoming_packet(Packet::UnsubAck(UnsubAck {
+    s.handle_incoming_packet(&mut Packet::UnsubAck(UnsubAck {
         pkid: 3,
         reasons: vec![UnsubAckReason::Success],
         properties: None,
     }))
     .unwrap();
-    s.handle_incoming_packet(Packet::PubComp(PubComp::new(1, None)))
+    s.handle_incoming_packet(&mut Packet::PubComp(PubComp::new(1, None)))
         .unwrap();
     assert!(!s.pending());
 }
@@ -185,17 +185,17 @@ fn aliases_are_resolved_and_rejected_before_outgoing_admission() {
         topic_alias: Some(2),
         ..Default::default()
     });
-    s.handle_incoming_packet(Packet::Publish(p.clone()))
+    s.handle_incoming_packet(&mut Packet::Publish(p.clone()))
         .unwrap();
     s.events.clear();
     p.topic = bytes::Bytes::new();
-    s.handle_incoming_packet(Packet::Publish(p.clone()))
+    s.handle_incoming_packet(&mut Packet::Publish(p.clone()))
         .unwrap();
     assert!(
         matches!(s.events.pop_front(), Some(Event::Incoming(Packet::Publish(p))) if p.topic.as_ref() == b"fixture")
     );
     assert!(s.handle_outgoing_packet(Request::Publish(p)).is_err());
-    s.handle_incoming_packet(Packet::ConnAck(ConnAck {
+    s.handle_incoming_packet(&mut Packet::ConnAck(ConnAck {
         session_present: false,
         code: ConnectReturnCode::Success,
         properties: Some(ConnAckProperties {
@@ -221,13 +221,13 @@ fn initial_allocation_is_admissible_before_construction_and_ping_is_correlated()
     assert!(s.retained_bytes() <= MqttState::initial_memory_bound(1024));
     assert!(s.configure_receive(0, 0, 100, true).is_err());
     assert!(s
-        .handle_incoming_packet(Packet::PingResp(PingResp))
+        .handle_incoming_packet(&mut Packet::PingResp(PingResp))
         .is_err());
     s.handle_outgoing_packet(Request::PingReq).unwrap();
-    s.handle_incoming_packet(Packet::PingResp(PingResp))
+    s.handle_incoming_packet(&mut Packet::PingResp(PingResp))
         .unwrap();
     assert!(s
-        .handle_incoming_packet(Packet::PingResp(PingResp))
+        .handle_incoming_packet(&mut Packet::PingResp(PingResp))
         .is_err());
 }
 
@@ -251,9 +251,9 @@ fn admission_bounds_include_table_growth_and_property_allocations() {
             topic_alias: Some(id),
             ..Default::default()
         });
-        let packet = Packet::Publish(p);
+        let mut packet = Packet::Publish(p);
         let bound = s.incoming_memory_bound(&packet);
-        s.handle_incoming_packet(packet).unwrap();
+        s.handle_incoming_packet(&mut packet).unwrap();
         s.events.clear();
         assert!(s.retained_bytes() <= bound, "incoming allocation {id}");
     }
@@ -262,7 +262,7 @@ fn admission_bounds_include_table_growth_and_property_allocations() {
 #[test]
 fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
     let mut s = state(false);
-    s.handle_incoming_packet(Packet::ConnAck(ConnAck {
+    s.handle_incoming_packet(&mut Packet::ConnAck(ConnAck {
         session_present: false,
         code: ConnectReturnCode::Success,
         properties: Some(ConnAckProperties {
@@ -284,7 +284,7 @@ fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
         s.handle_outgoing_packet(Request::Publish(p)).unwrap();
     }
     s.resume_session();
-    s.handle_incoming_packet(Packet::ConnAck(ConnAck {
+    s.handle_incoming_packet(&mut Packet::ConnAck(ConnAck {
         session_present: true,
         code: ConnectReturnCode::Success,
         properties: Some(ConnAckProperties {
@@ -301,7 +301,7 @@ fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
         assert!(p.dup);
         assert!(p.properties.unwrap().topic_alias.is_none());
         assert!(!s.has_resumed_packet());
-        s.handle_incoming_packet(Packet::PubAck(PubAck::new(p.pkid, None)))
+        s.handle_incoming_packet(&mut Packet::PubAck(PubAck::new(p.pkid, None)))
             .unwrap();
     }
     assert!(!s.pending());
