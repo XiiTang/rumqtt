@@ -1,7 +1,7 @@
 use crate::{Event, Incoming, Outgoing, Request};
 use std::sync::{
-    Arc as RuntimeArc,
     atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
+    Arc as RuntimeArc,
 };
 
 use crate::mqttbytes::v4::*;
@@ -99,7 +99,7 @@ impl MqttState {
         std::mem::size_of::<Self>()
             + slots * (std::mem::size_of::<Option<Publish>>() + 2 * std::mem::size_of::<u64>())
             + 3 * (65536 / 8 + 64)
-            + 2 * (slots.div_ceil(8) + 64)
+            + 2 * ((slots + 7) / 8 + 64)
             + 100 * std::mem::size_of::<Event>()
     }
 
@@ -200,7 +200,7 @@ impl MqttState {
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
                 .get(*id as usize)
-                .is_some_and(Option::is_some)
+                .map_or(false, Option::is_some)
         });
     }
     fn next_send_order(&mut self) -> Result<u64, StateError> {
@@ -377,7 +377,7 @@ impl MqttState {
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
                 .get(*id as usize)
-                .is_some_and(Option::is_some)
+                .map_or(false, Option::is_some)
         });
         self.last_incoming = Instant::now();
 
@@ -1183,8 +1183,9 @@ mod runtime_resume_tests {
             )))
             .unwrap()
             .unwrap();
-        let Packet::Publish(original) = original else {
-            panic!()
+        let original = match original {
+            Packet::Publish(value) => value,
+            _ => panic!(),
         };
         let mut incoming = Publish::new("in", QoS::ExactlyOnce, "body");
         incoming.pkid = 7;
@@ -1193,8 +1194,9 @@ mod runtime_resume_tests {
             .unwrap();
         let (packets, interrupted) = state.resume_session();
         assert!(interrupted.is_empty());
-        let Packet::Publish(resumed) = &packets[0] else {
-            panic!()
+        let resumed = match &packets[0] {
+            Packet::Publish(value) => value,
+            _ => panic!(),
         };
         assert_eq!(resumed.pkid, original.pkid);
         assert!(resumed.dup);
@@ -1207,12 +1209,10 @@ mod runtime_resume_tests {
         state
             .handle_incoming_packet(Packet::Publish(incoming))
             .unwrap();
-        assert!(
-            !state
-                .events
-                .iter()
-                .any(|e| matches!(e, Event::Incoming(Packet::Publish(_))))
-        );
+        assert!(!state
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Incoming(Packet::Publish(_)))));
     }
 }
 

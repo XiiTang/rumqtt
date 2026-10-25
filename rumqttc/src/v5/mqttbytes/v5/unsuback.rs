@@ -223,6 +223,18 @@ fn code(reason: UnsubAckReason) -> u8 {
     }
 }
 
+impl From<UnsubAckReason> for u8 {
+    fn from(value: UnsubAckReason) -> Self {
+        code(value)
+    }
+}
+impl TryFrom<u8> for UnsubAckReason {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        reason(value)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::super::test::{USER_PROP_KEY, USER_PROP_VAL};
@@ -252,17 +264,5 @@ mod test {
 
         assert_eq!(size_from_write, size_from_bytes);
         assert_eq!(size_from_size, size_from_bytes);
-    }
-}
-
-impl From<UnsubAckReason> for u8 {
-    fn from(value: UnsubAckReason) -> Self {
-        code(value)
-    }
-}
-impl TryFrom<u8> for UnsubAckReason {
-    type Error = Error;
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        reason(value)
     }
 }

@@ -20,20 +20,20 @@ use tokio::time::timeout;
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("Failed to send mqtt requests to eventloop")]
-    Request(Request),
+    Request(Box<Request>),
     #[error("Failed to send mqtt requests to eventloop")]
-    TryRequest(Request),
+    TryRequest(Box<Request>),
 }
 
 impl From<SendError<Request>> for ClientError {
     fn from(e: SendError<Request>) -> Self {
-        Self::Request(e.into_inner())
+        Self::Request(Box::new(e.into_inner()))
     }
 }
 
 impl From<TrySendError<Request>> for ClientError {
     fn from(e: TrySendError<Request>) -> Self {
-        Self::TryRequest(e.into_inner())
+        Self::TryRequest(Box::new(e.into_inner()))
     }
 }
 
@@ -88,7 +88,7 @@ impl AsyncClient {
         publish.retain = retain;
         let publish = Request::Publish(publish);
         if !valid_topic(&topic) {
-            return Err(ClientError::Request(publish));
+            return Err(ClientError::Request(Box::new(publish)));
         }
         self.request_tx.send_async(publish).await?;
         Ok(())
@@ -142,7 +142,7 @@ impl AsyncClient {
         publish.retain = retain;
         let publish = Request::Publish(publish);
         if !valid_topic(&topic) {
-            return Err(ClientError::TryRequest(publish));
+            return Err(ClientError::TryRequest(Box::new(publish)));
         }
         self.request_tx.try_send(publish)?;
         Ok(())
@@ -213,7 +213,7 @@ impl AsyncClient {
         publish.retain = retain;
         let publish = Request::Publish(publish);
         if !valid_topic(&topic) {
-            return Err(ClientError::TryRequest(publish));
+            return Err(ClientError::TryRequest(Box::new(publish)));
         }
         self.request_tx.send_async(publish).await?;
         Ok(())
@@ -258,7 +258,7 @@ impl AsyncClient {
         let filter = Filter::new(topic, qos);
         let subscribe = Subscribe::new(filter, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::Request(subscribe.into()));
+            return Err(ClientError::Request(Box::new(subscribe.into())));
         }
 
         self.request_tx.send_async(subscribe.into()).await?;
@@ -288,7 +288,7 @@ impl AsyncClient {
         let filter = Filter::new(topic, qos);
         let subscribe = Subscribe::new(filter, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::TryRequest(subscribe.into()));
+            return Err(ClientError::TryRequest(Box::new(subscribe.into())));
         }
 
         self.request_tx.try_send(subscribe.into())?;
@@ -319,7 +319,7 @@ impl AsyncClient {
     {
         let subscribe = Subscribe::new_many(topics, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::Request(subscribe.into()));
+            return Err(ClientError::Request(Box::new(subscribe.into())));
         }
 
         self.request_tx.send_async(subscribe.into()).await?;
@@ -356,7 +356,7 @@ impl AsyncClient {
     {
         let subscribe = Subscribe::new_many(topics, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::TryRequest(subscribe.into()));
+            return Err(ClientError::TryRequest(Box::new(subscribe.into())));
         }
 
         self.request_tx.try_send(subscribe.into())?;
@@ -513,7 +513,7 @@ impl Client {
         publish.retain = retain;
         let publish = Request::Publish(publish);
         if !valid_topic(&topic) {
-            return Err(ClientError::Request(publish));
+            return Err(ClientError::Request(Box::new(publish)));
         }
         self.client.request_tx.send(publish)?;
         Ok(())
@@ -604,7 +604,7 @@ impl Client {
         let filter = Filter::new(topic, qos);
         let subscribe = Subscribe::new(filter, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::Request(subscribe.into()));
+            return Err(ClientError::Request(Box::new(subscribe.into())));
         }
 
         self.client.request_tx.send(subscribe.into())?;
@@ -650,7 +650,7 @@ impl Client {
     {
         let subscribe = Subscribe::new_many(topics, properties);
         if !subscribe_has_valid_filters(&subscribe) {
-            return Err(ClientError::Request(subscribe.into()));
+            return Err(ClientError::Request(Box::new(subscribe.into())));
         }
 
         self.client.request_tx.send(subscribe.into())?;

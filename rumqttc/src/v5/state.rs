@@ -5,8 +5,8 @@ use super::mqttbytes::v5::{
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
 use std::sync::{
-    Arc as RuntimeArc,
     atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
+    Arc as RuntimeArc,
 };
 
 use super::{Event, Incoming, Outgoing, Request};
@@ -261,7 +261,7 @@ impl MqttState {
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
                 .get(*id as usize)
-                .is_some_and(Option::is_some)
+                .map_or(false, Option::is_some)
         });
     }
     fn next_send_order(&mut self) -> Result<u64, StateError> {
@@ -286,7 +286,7 @@ impl MqttState {
         self.outgoing_expiry_started.retain(|id, _| {
             self.outgoing_pub
                 .get(*id as usize)
-                .is_some_and(Option::is_some)
+                .map_or(false, Option::is_some)
         });
         self.await_pingresp = false;
         self.collision_ping_count = 0;
@@ -333,7 +333,7 @@ impl MqttState {
     }
     pub fn has_resumed_packet(&self) -> bool {
         !self.resume_acks.is_empty()
-            || self.resume_queue.front().is_some_and(|id| {
+            || self.resume_queue.front().map_or(false, |id| {
                 self.outgoing_rel.contains(*id as usize)
                     || self.resume_sent.count_ones(..) < self.max_outgoing_inflight as usize
             })
@@ -349,8 +349,9 @@ impl MqttState {
             if self.outgoing_rel.contains(id as usize) {
                 return Some(Packet::PubRel(PubRel::new(id, None)));
             }
-            let Some(mut publish) = self.outgoing_pub[id as usize].clone() else {
-                continue;
+            let mut publish = match self.outgoing_pub[id as usize].clone() {
+                Some(publish) => publish,
+                None => continue,
             };
             if let Some(properties) = &mut publish.properties {
                 properties.topic_alias = None;
@@ -447,12 +448,13 @@ impl MqttState {
         }
 
         if !duplicate {
-            self.events.insert(event_index, Event::Incoming(packet.clone()));
+            self.events
+                .insert(event_index, Event::Incoming(Box::new(packet.clone())));
         }
         self.transmission_flags.retain(|id, _| {
             self.outgoing_pub
                 .get(*id as usize)
-                .is_some_and(Option::is_some)
+                .map_or(false, Option::is_some)
         });
         self.last_incoming = Instant::now();
         Ok(outgoing)
@@ -631,7 +633,10 @@ impl MqttState {
             .get_mut(puback.pkid as usize)
             .ok_or(StateError::Unsolicited(puback.pkid))?;
 
-        if !publish.as_ref().is_some_and(|p| p.qos == QoS::AtLeastOnce) {
+        if !publish
+            .as_ref()
+            .map_or(false, |p| p.qos == QoS::AtLeastOnce)
+        {
             error!("Unsolicited puback packet: {:?}", puback.pkid);
             return Err(StateError::Unsolicited(puback.pkid));
         }
@@ -678,7 +683,7 @@ impl MqttState {
             .outgoing_pub
             .get_mut(id)
             .ok_or(StateError::Unsolicited(pubrec.pkid))?;
-        if !slot.as_ref().is_some_and(|p| p.qos == QoS::ExactlyOnce) {
+        if !slot.as_ref().map_or(false, |p| p.qos == QoS::ExactlyOnce) {
             return Err(StateError::Unsolicited(pubrec.pkid));
         }
         slot.take();
@@ -1109,6 +1114,9 @@ impl MqttState {
                 .map(|v| v.len())
                 .sum::<usize>()
             + self.events.capacity() * std::mem::size_of::<Event>()
+            // Incoming packet storage moved out of the event queue into boxes.
+            + self.events.iter().filter(|event| matches!(event, Event::Incoming(_))).count()
+                * std::mem::size_of::<Incoming>()
     }
     fn acknowledgement_memory(packet: &Packet) -> usize {
         macro_rules! properties {

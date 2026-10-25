@@ -235,6 +235,18 @@ fn code(value: SubscribeReasonCode) -> u8 {
     }
 }
 
+impl From<SubscribeReasonCode> for u8 {
+    fn from(value: SubscribeReasonCode) -> Self {
+        code(value)
+    }
+}
+impl TryFrom<u8> for SubscribeReasonCode {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        reason(value)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::super::test::{USER_PROP_KEY, USER_PROP_VAL};
@@ -264,17 +276,5 @@ mod test {
 
         assert_eq!(size_from_write, size_from_bytes);
         assert_eq!(size_from_size, size_from_bytes);
-    }
-}
-
-impl From<SubscribeReasonCode> for u8 {
-    fn from(value: SubscribeReasonCode) -> Self {
-        code(value)
-    }
-}
-impl TryFrom<u8> for SubscribeReasonCode {
-    type Error = Error;
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        reason(value)
     }
 }

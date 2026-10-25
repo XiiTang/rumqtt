@@ -220,7 +220,7 @@ impl Packet {
         let (has_packet, has_will) = match self {
             Self::Connect(p, w, _) => (
                 p.properties.is_some(),
-                w.as_ref().is_some_and(|w| w.properties.is_some()),
+                w.as_ref().map_or(false, |w| w.properties.is_some()),
             ),
             Self::Auth(p) => (p.properties.is_some(), false),
             Self::Publish(p) => (p.properties.is_some(), false),

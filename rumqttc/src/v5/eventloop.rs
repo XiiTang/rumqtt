@@ -87,7 +87,7 @@ pub struct EventLoop {
 /// Events which can be yielded by the event loop
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Incoming(Incoming),
+    Incoming(Box<Incoming>),
     Outgoing(Outgoing),
 }
 

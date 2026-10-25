@@ -125,3 +125,60 @@ checks automatic and manual acknowledgement, alias-only duplicates and alias
 reassignment on a duplicate. Boundless's independent-byte peer test
 `issue_167_a_duplicate_named_by_its_alias_carries_the_topic` checks the actual
 program-visible topic and the peer's PUBREC in both acknowledgement modes.
+
+## Strict Clippy on Rust 1.97 (#320)
+
+Reproduced on Boundless's pin `11ca1518d43f8ecc6fb84dbad3dca3c8cb6fe469`:
+`52bf09b1fee92cf29edd007a5d78c335ffa70d2f` has the identical source tree and
+only adds history-preservation merges. On macOS arm64 with Rust 1.97.0,
+`cargo clippy -p rumqttc --lib --tests --locked --no-default-features -- -D warnings`
+exited 101: 38 `result_large_err`, one `large_enum_variant`, ten
+`incompatible_msrv`, two `derivable_impls`, and seven
+`items_after_test_module` diagnostics. All 58 issue findings reproduced. Once these library diagnostics were fixed,
+the same command exited 101 with three newly reached `unused_must_use`
+warnings in `runtime_v5_state`: the tests ignored `resume_session` results.
+They now assert successful recovery with `unwrap`, as the existing state
+tests do, without changing production recovery or hiding an error.
+
+Keep upstream's declared Rust 1.64.0 MSRV. Replace `is_some_and` with
+`map_or(false, ...)`, bounded integer `div_ceil` with the same arithmetic
+already used by the MQTT 5 allocation bound, and `let ... else` with `match`.
+The ceiling expression cannot overflow: its input is a `u16` plus one.
+Enum `Default` derives and `#[default]` are available since Rust 1.62.
+No newer Rust feature is needed by this repair, so no MSRV increase is warranted.
+The existing lockfile resolves newer upstream dependencies (including Tokio
+1.48 requiring Rust 1.71); it is not a Rust 1.64 dependency fixture. This patch
+preserves that graph and makes no claim of a complete locked build on 1.64.
+
+Box the MQTT 5 `ClientError::{Request, TryRequest}` payloads, retaining the
+complete rejected request, original error variant, display text and source.
+Box `v5::Event::Incoming` and count its packet allocation in `retained_bytes`.
+The queued packet, event order and duplicate suppression stay unchanged. Users
+matching the payload use the box's reference or dereference it; the MQTT 5
+manual-acknowledgement example and state regression are updated accordingly.
+The two existing enum defaults are derived with the same default variants.
+The seven reason-code conversions move before their test modules unchanged.
+No lint suppression is added. Upstream HEAD
+`e886a788935d1b78a666b45124b9036cd6d14002` was reviewed: it still uses the
+inline MQTT 5 error/event payloads and manual enum defaults, and has no newer
+repair to transplant for these findings. Existing fork code already uses boxed
+packets for `ConnectionError::NotConnAck`.
+
+The shared error conversions and direct client rejection sites are the error
+representation boundary; `MqttState::handle_incoming_packet` is the single
+MQTT 5 incoming-event construction point. The `runtime_v5_clippy` regressions
+cover full/disconnected channel errors, synchronous and asynchronous clients,
+invalid-topic rejection (including the existing bytes-API variant), full
+request contents, and an incoming event's unchanged packet and accounted box.
+Existing MQTT 3/5 state, codec, writer and alias regressions cover the other paths.
+
+Validation after the repair on Rust 1.97.0, macOS arm64:
+
+- `cargo clippy -p rumqttc --lib --tests --locked --no-default-features -- -D warnings`: exit 0 (the same command that exited 101 before the repair).
+- `cargo test -p rumqttc --lib --test runtime_state --test runtime_v5_state --test runtime_v5_codec --test runtime_v5_writer --test runtime_v5_alias --test runtime_v5_clippy --locked --no-default-features`: exit 0; 113 passed, zero failed.
+- `cargo check -p rumqttc --example async_manual_acks_v5 --locked --no-default-features`: exit 0.
+- `cargo fmt -p rumqttc -- --check`: exit 0.
+
+All compilation and tests used the shared build-slot wrapper with incremental
+compilation disabled. The reconnecting broker/reliability integration suites
+and optional TLS/websocket/proxy feature combinations were not exercised.

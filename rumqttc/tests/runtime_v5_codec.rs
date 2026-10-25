@@ -62,8 +62,9 @@ fn auth_and_disconnect_allow_omitted_default_fields() {
 
 #[test]
 fn repeated_subscription_identifiers_do_not_consume_payload() {
-    let Packet::Publish(p) = decode(b"\x30\x0b\0\x01a\x05\x0b\x01\x0b\x80\x01\xaa\xbb") else {
-        panic!()
+    let p = match decode(b"\x30\x0b\0\x01a\x05\x0b\x01\x0b\x80\x01\xaa\xbb") {
+        Packet::Publish(value) => value,
+        _ => panic!(),
     };
     assert_eq!(p.properties.unwrap().subscription_identifiers, vec![1, 128]);
     assert_eq!(&p.payload[..], b"\xaa\xbb");
@@ -147,8 +148,9 @@ fn property_order_is_recorded_during_the_same_decode() {
     let result = Packet::read_frame_with_property_order(frame.clone(), None).unwrap();
     assert_eq!(result.property_order.packet, vec![38, 21, 38, 22]);
     assert!(result.property_order.will.is_empty());
-    let Packet::Auth(auth) = result.packet else {
-        panic!()
+    let auth = match result.packet {
+        Packet::Auth(value) => value,
+        _ => panic!(),
     };
     assert_eq!(
         auth.properties.unwrap().user_properties,

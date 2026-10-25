@@ -192,7 +192,7 @@ fn aliases_are_resolved_and_rejected_before_outgoing_admission() {
     s.handle_incoming_packet(&mut Packet::Publish(p.clone()))
         .unwrap();
     assert!(
-        matches!(s.events.pop_front(), Some(Event::Incoming(Packet::Publish(p))) if p.topic.as_ref() == b"fixture")
+        matches!(s.events.pop_front(), Some(Event::Incoming(packet)) if matches!(packet.as_ref(), Packet::Publish(p) if p.topic.as_ref() == b"fixture"))
     );
     assert!(s.handle_outgoing_packet(Request::Publish(p)).is_err());
     s.handle_incoming_packet(&mut Packet::ConnAck(ConnAck {
@@ -283,7 +283,7 @@ fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
         );
         s.handle_outgoing_packet(Request::Publish(p)).unwrap();
     }
-    s.resume_session();
+    s.resume_session().unwrap();
     s.handle_incoming_packet(&mut Packet::ConnAck(ConnAck {
         session_present: true,
         code: ConnectReturnCode::Success,
@@ -294,8 +294,9 @@ fn resume_preserves_alias_target_after_reassignment_and_respects_new_window() {
     }))
     .unwrap();
     for expected in ["first", "first", "changed"] {
-        let Packet::Publish(p) = s.next_resumed_packet().unwrap() else {
-            panic!()
+        let p = match s.next_resumed_packet().unwrap() {
+            Packet::Publish(value) => value,
+            _ => panic!(),
         };
         assert_eq!(p.topic.as_ref(), expected.as_bytes());
         assert!(p.dup);
@@ -320,7 +321,7 @@ fn expired_publication_is_not_replayed_after_resume() {
         }),
     )))
     .unwrap();
-    s.resume_session();
+    s.resume_session().unwrap();
     assert!(s.next_resumed_packet().is_none());
     assert!(!s.pending());
 }
@@ -328,18 +329,19 @@ fn expired_publication_is_not_replayed_after_resume() {
 #[test]
 fn cancelled_before_writer_publication_is_not_transmitted_by_resume() {
     let mut s = state(false);
-    let Packet::Publish(p) = s
+    let p = match s
         .handle_outgoing_packet(Request::Publish(publish(QoS::AtLeastOnce, 0, false)))
         .unwrap()
         .unwrap()
-    else {
-        panic!()
+    {
+        Packet::Publish(value) => value,
+        _ => panic!(),
     };
     s.track_publish_transmission(
         p.pkid,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    s.resume_session();
+    s.resume_session().unwrap();
     assert!(!s.has_resumed_packet());
     assert!(!s.pending());
 }
