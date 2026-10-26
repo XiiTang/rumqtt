@@ -182,3 +182,28 @@ Validation after the repair on Rust 1.97.0, macOS arm64:
 All compilation and tests used the shared build-slot wrapper with incremental
 compilation disabled. The reconnecting broker/reliability integration suites
 and optional TLS/websocket/proxy feature combinations were not exercised.
+
+## Passive publication retirement facts (W14a)
+
+Explicit session recovery already removes never-transmitted publications and MQTT 5
+replay already removes expired QoS1 publications. A caller owning retained publication
+outcomes otherwise receives no native completion for these removals.
+`MqttState::take_publication_retirements` (both versions) passively drains typed
+NotTransmitted / MessageExpired facts emitted only where those existing removals
+occur. MessageExpired retains the native expiry interval; no payload, timer, new
+expiry rule or retry is added. The caller drains after resume and every replay call,
+including None. The private native removal branches are the emission checkpoint;
+callers cannot insert a fact. The drain transfers its accounted Vec backing.
+
+Regression coverage: state.rs unsent removal/drain backing (F1/F5); v5/state.rs
+unsent removal, Some/None replay expiry and drain backing (F2/F3/F4/F5), plus preserved
+sent-QoS2 recovery. Boundless adapter T16/T20 coverage belongs to the pin integration.
+
+Validation on macOS arm64, Rust 1.97.0, based on `111f5ddac9b77c8f493a5595607a262cd7fd654e`:
+
+- `cargo +1.97.0 test -p rumqttc --lib --test runtime_state --test runtime_v5_state --locked --no-default-features retirement`: exit 0, six library regressions; integration tests filtered out.
+- `cargo +1.97.0 test -p rumqttc --lib --test runtime_state --test runtime_v5_state --locked --no-default-features recovery`: exit 0; scoped recovery regressions only.
+- `cargo +1.97.0 clippy -p rumqttc --lib --tests --locked --no-default-features -- -D warnings`: exit 0.
+
+All compilation/tests used build-slot with incremental compilation disabled.
+Optional transports, broker interoperability and the reconnecting EventLoop were not run.

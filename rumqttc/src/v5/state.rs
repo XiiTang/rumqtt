@@ -4,6 +4,7 @@ use super::mqttbytes::v5::{
     SubscribeReasonCode, UnsubAck, Unsubscribe,
 };
 use super::mqttbytes::{self, Error as MqttError, QoS};
+use crate::{PublicationRetirement, PublicationRetirementReason};
 use std::sync::{
     atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
     Arc as RuntimeArc,
@@ -87,6 +88,7 @@ impl From<mqttbytes::Error> for StateError {
 // Any missing acks from the broker are detected during the next recycled use of packet ids
 #[derive(Debug, Clone)]
 pub struct MqttState {
+    publication_retirements: Vec<PublicationRetirement>,
     transmission_flags: std::collections::BTreeMap<u16, RuntimeArc<RuntimeAtomicBool>>,
     /// Status of last ping
     pub await_pingresp: bool,
@@ -150,6 +152,7 @@ impl MqttState {
     /// instantiated for clean sessions
     pub fn new(max_inflight: u16, manual_acks: bool) -> Self {
         MqttState {
+            publication_retirements: Vec::new(),
             transmission_flags: Default::default(),
             await_pingresp: false,
             collision_ping_count: 0,
@@ -241,6 +244,12 @@ impl MqttState {
     pub fn track_publish_transmission(&mut self, id: u16, flag: RuntimeArc<RuntimeAtomicBool>) {
         self.transmission_flags.insert(id, flag);
     }
+    /// Drains passive removal observations without changing native exchange state.
+    /// Drain after `resume_session` and every `next_resumed_packet` call (where
+    /// available), including a call returning None. Peer ACKs are not retirements.
+    pub fn take_publication_retirements(&mut self) -> Vec<PublicationRetirement> {
+        std::mem::take(&mut self.publication_retirements)
+    }
     fn discard_unsent_publications(&mut self) {
         let unsent: Vec<_> = self
             .transmission_flags
@@ -255,6 +264,10 @@ impl MqttState {
                 .is_some()
             {
                 self.inflight -= 1;
+                self.publication_retirements.push(PublicationRetirement {
+                    packet_id: id,
+                    reason: PublicationRetirementReason::NotTransmitted,
+                });
             }
             self.transmission_flags.remove(&id);
         }
@@ -365,6 +378,12 @@ impl MqttState {
                         self.outgoing_pub[id as usize] = None;
                         self.outgoing_expiry_started.remove(&id);
                         self.inflight -= 1;
+                        self.publication_retirements.push(PublicationRetirement {
+                            packet_id: id,
+                            reason: PublicationRetirementReason::MessageExpired {
+                                expiry_interval_seconds: *expiry,
+                            },
+                        });
                         continue;
                     }
                     *expiry = expiry.saturating_sub(elapsed.min(u64::from(u32::MAX)) as u32);
@@ -1069,6 +1088,7 @@ impl MqttState {
             + (self.publication_order.capacity() + self.release_order.capacity())
                 * std::mem::size_of::<u64>()
             + self.transmission_flags.len() * 128
+            + self.publication_retirements.capacity() * std::mem::size_of::<PublicationRetirement>()
             + self.resume_acks.capacity() * std::mem::size_of::<usize>()
             + self.completing_packets.capacity() * (128 + std::mem::size_of::<Packet>())
             + self
@@ -1763,6 +1783,7 @@ mod recovery_correctness_tests {
         state.handle_incoming_pubrec(&PubRec::new(1, None)).unwrap();
         state.resume_session().unwrap();
         assert!(matches!(state.next_resumed_packet(), Some(Packet::PubRel(p)) if p.pkid == 1));
+        assert!(state.take_publication_retirements().is_empty());
     }
     #[test]
     fn publish_and_pubrel_recovery_use_their_own_original_order() {
@@ -1789,5 +1810,134 @@ mod recovery_correctness_tests {
         for id in [5, 9, 1] {
             assert!(matches!(state.next_resumed_packet(), Some(Packet::PubRel(p)) if p.pkid == id));
         }
+    }
+}
+
+#[cfg(test)]
+mod publication_retirement_tests {
+    use super::*;
+    fn unsent_fixture() -> MqttState {
+        let mut state = MqttState::new(4, false);
+        for (id, qos, transmitted) in [
+            (1, QoS::AtLeastOnce, false),
+            (2, QoS::AtLeastOnce, true),
+            (3, QoS::ExactlyOnce, false),
+        ] {
+            let mut publish = Publish::new("out", qos, "body", None);
+            publish.pkid = id;
+            state
+                .handle_outgoing_packet(Request::Publish(publish))
+                .unwrap();
+            state.track_publish_transmission(
+                id,
+                RuntimeArc::new(RuntimeAtomicBool::new(transmitted)),
+            );
+        }
+        state.resume_session().unwrap();
+        assert!(
+            matches!(state.next_resumed_packet(), Some(Packet::Publish(p)) if p.pkid == 2 && p.dup)
+        );
+        state
+    }
+    #[test]
+    fn resume_reports_only_removed_unsent_publications_once() {
+        let mut state = unsent_fixture();
+        let facts = state.take_publication_retirements();
+        let mut ids: Vec<_> = facts
+            .iter()
+            .map(|fact| {
+                assert_eq!(fact.reason, PublicationRetirementReason::NotTransmitted);
+                fact.packet_id
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(state.inflight(), 1);
+        assert!(state.take_publication_retirements().is_empty());
+        state.resume_session().unwrap();
+        assert!(state.take_publication_retirements().is_empty());
+        state
+            .handle_incoming_packet(&mut Packet::PubAck(PubAck::new(2, None)))
+            .unwrap();
+        assert_eq!(state.inflight(), 0);
+        assert!(state.take_publication_retirements().is_empty());
+    }
+    #[test]
+    fn retirement_backing_follows_the_drain() {
+        let mut state = unsent_fixture();
+        let before = state.retained_bytes();
+        let capacity = state.publication_retirements.capacity();
+        let inflight = state.inflight();
+        let facts = state.take_publication_retirements();
+        assert_eq!(
+            before - state.retained_bytes(),
+            capacity * std::mem::size_of::<PublicationRetirement>()
+        );
+        assert_eq!(facts.capacity(), capacity);
+        assert!(!facts.is_empty());
+        assert_eq!(state.inflight(), inflight);
+        assert!(state.take_publication_retirements().is_empty());
+    }
+    fn expired_fixture(sibling: bool) -> MqttState {
+        let mut state = MqttState::new(4, false);
+        for (id, qos, expiry) in [(1, QoS::AtLeastOnce, 2), (2, QoS::ExactlyOnce, 0)] {
+            if id == 2 && !sibling {
+                continue;
+            }
+            let properties = crate::v5::mqttbytes::v5::PublishProperties {
+                message_expiry_interval: Some(expiry),
+                ..Default::default()
+            };
+            let mut publish = Publish::new("out", qos, "body", Some(properties));
+            publish.pkid = id;
+            state
+                .handle_outgoing_packet(Request::Publish(publish))
+                .unwrap();
+            state.track_publish_transmission(id, RuntimeArc::new(RuntimeAtomicBool::new(true)));
+        }
+        state
+            .outgoing_expiry_started
+            .insert(1, Instant::now() - std::time::Duration::from_secs(3));
+        state.resume_session().unwrap();
+        assert!(state.take_publication_retirements().is_empty());
+        state
+    }
+    fn assert_expiry(state: &mut MqttState) {
+        assert_eq!(
+            state.take_publication_retirements(),
+            vec![PublicationRetirement {
+                packet_id: 1,
+                reason: PublicationRetirementReason::MessageExpired {
+                    expiry_interval_seconds: 2
+                }
+            }]
+        );
+        assert!(state.outgoing_pub[1].is_none());
+        assert!(state.take_publication_retirements().is_empty());
+        state.resume_session().unwrap();
+        assert!(state.take_publication_retirements().is_empty());
+    }
+    #[test]
+    fn expired_qos1_retirement_precedes_the_next_replayed_packet() {
+        let mut state = expired_fixture(true);
+        assert!(
+            matches!(state.next_resumed_packet(), Some(Packet::Publish(p)) if p.pkid == 2 && p.dup)
+        );
+        assert_eq!(state.inflight(), 1);
+        assert_expiry(&mut state);
+        state.handle_incoming_pubrec(&PubRec::new(2, None)).unwrap();
+        state
+            .handle_incoming_pubcomp(&PubComp::new(2, None))
+            .unwrap();
+        assert!(state.take_publication_retirements().is_empty());
+    }
+    #[test]
+    fn expired_qos1_retirement_is_available_when_replay_returns_none() {
+        let mut state = expired_fixture(false);
+        assert!(state.next_resumed_packet().is_none());
+        assert_eq!(state.inflight(), 0);
+        assert_expiry(&mut state);
+        assert!(state.next_resumed_packet().is_none());
+        assert!(state.take_publication_retirements().is_empty());
     }
 }

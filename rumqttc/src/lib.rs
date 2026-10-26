@@ -109,6 +109,7 @@ mod client;
 mod eventloop;
 mod framed;
 pub mod mqttbytes;
+mod publication_retirement;
 mod state;
 pub mod v5;
 
@@ -140,6 +141,7 @@ pub use client::{
 pub use eventloop::{ConnectionError, Event, EventLoop};
 pub use mqttbytes::v4::*;
 pub use mqttbytes::*;
+pub use publication_retirement::{PublicationRetirement, PublicationRetirementReason};
 #[cfg(feature = "use-rustls-no-provider")]
 use rustls_native_certs::load_native_certs;
 pub use state::{MqttState, StateError};

@@ -1,4 +1,5 @@
 use crate::{Event, Incoming, Outgoing, Request};
+use crate::{PublicationRetirement, PublicationRetirementReason};
 use std::sync::{
     atomic::{AtomicBool as RuntimeAtomicBool, Ordering as RuntimeOrdering},
     Arc as RuntimeArc,
@@ -46,6 +47,7 @@ pub enum StateError {
 // Any missing acks from the broker are detected during the next recycled use of packet ids
 #[derive(Debug, Clone)]
 pub struct MqttState {
+    publication_retirements: Vec<PublicationRetirement>,
     transmission_flags: std::collections::BTreeMap<u16, RuntimeArc<RuntimeAtomicBool>>,
     /// Status of last ping
     pub await_pingresp: bool,
@@ -108,6 +110,7 @@ impl MqttState {
     /// instantiated for clean sessions
     pub fn new(max_inflight: u16, manual_acks: bool) -> Self {
         MqttState {
+            publication_retirements: Vec::new(),
             transmission_flags: Default::default(),
             await_pingresp: false,
             collision_ping_count: 0,
@@ -180,6 +183,12 @@ impl MqttState {
     pub fn track_publish_transmission(&mut self, id: u16, flag: RuntimeArc<RuntimeAtomicBool>) {
         self.transmission_flags.insert(id, flag);
     }
+    /// Drains passive removal observations without changing native exchange state.
+    /// Drain after `resume_session` and every `next_resumed_packet` call (where
+    /// available), including a call returning None. Peer ACKs are not retirements.
+    pub fn take_publication_retirements(&mut self) -> Vec<PublicationRetirement> {
+        std::mem::take(&mut self.publication_retirements)
+    }
     fn discard_unsent_publications(&mut self) {
         let unsent: Vec<_> = self
             .transmission_flags
@@ -194,6 +203,10 @@ impl MqttState {
                 .is_some()
             {
                 self.inflight -= 1;
+                self.publication_retirements.push(PublicationRetirement {
+                    packet_id: id,
+                    reason: PublicationRetirementReason::NotTransmitted,
+                });
             }
             self.transmission_flags.remove(&id);
         }
@@ -265,6 +278,7 @@ impl MqttState {
             + (self.publication_order.capacity() + self.release_order.capacity())
                 * std::mem::size_of::<u64>()
             + self.transmission_flags.len() * 128
+            + self.publication_retirements.capacity() * std::mem::size_of::<PublicationRetirement>()
             + self.outgoing_pub.capacity() * std::mem::size_of::<Option<Publish>>()
             + self
                 .outgoing_pub
@@ -1254,5 +1268,66 @@ mod recovery_order_tests {
                 .collect::<Vec<_>>(),
             vec![5, 9, 1]
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_retirement_tests {
+    use super::*;
+    fn unsent_fixture() -> MqttState {
+        let mut state = MqttState::new(4, false);
+        for (id, qos, transmitted) in [(1, QoS::AtLeastOnce, false), (2, QoS::AtLeastOnce, true)] {
+            let mut publish = Publish::new("out", qos, "body");
+            publish.pkid = id;
+            state
+                .handle_outgoing_packet(Request::Publish(publish))
+                .unwrap();
+            state.track_publish_transmission(
+                id,
+                RuntimeArc::new(RuntimeAtomicBool::new(transmitted)),
+            );
+        }
+        let (replayed, _) = state.resume_session();
+        assert!(matches!(&replayed[..], [Packet::Publish(p)] if p.pkid == 2 && p.dup));
+        state
+    }
+    #[test]
+    fn resume_reports_only_removed_unsent_publications_once() {
+        let mut state = unsent_fixture();
+        let facts = state.take_publication_retirements();
+        let mut ids: Vec<_> = facts
+            .iter()
+            .map(|fact| {
+                assert_eq!(fact.reason, PublicationRetirementReason::NotTransmitted);
+                fact.packet_id
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1]);
+        assert_eq!(state.inflight(), 1);
+        assert!(state.take_publication_retirements().is_empty());
+        let (_, _) = state.resume_session();
+        assert!(state.take_publication_retirements().is_empty());
+        state
+            .handle_incoming_packet(Packet::PubAck(PubAck::new(2)))
+            .unwrap();
+        assert_eq!(state.inflight(), 0);
+        assert!(state.take_publication_retirements().is_empty());
+    }
+    #[test]
+    fn retirement_backing_follows_the_drain() {
+        let mut state = unsent_fixture();
+        let before = state.retained_bytes();
+        let capacity = state.publication_retirements.capacity();
+        let inflight = state.inflight();
+        let facts = state.take_publication_retirements();
+        assert_eq!(
+            before - state.retained_bytes(),
+            capacity * std::mem::size_of::<PublicationRetirement>()
+        );
+        assert_eq!(facts.capacity(), capacity);
+        assert!(!facts.is_empty());
+        assert_eq!(state.inflight(), inflight);
+        assert!(state.take_publication_retirements().is_empty());
     }
 }
